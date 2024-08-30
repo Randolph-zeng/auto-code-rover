@@ -21,7 +21,7 @@ from app.log import (
 )
 from app.model import common, ollama
 from app.search.search_manage import SearchManager
-from app.utils import parse_function_invocation
+from app.utils import parse_function_invocation, parse_git_patch
 
 # FIXME: the system prompt should be different for stratified/state machine.
 SYSTEM_PROMPT = """You are a software developer maintaining a large project.
@@ -29,6 +29,34 @@ You are working on an issue submitted to your project.
 The issue contains a description marked between <issue> and </issue>.
 Your task is to invoke a few search API calls to gather buggy information, then write patches to solve the issues.
 """
+
+
+def prepare_explanation_prompt(repo, issue_description, ground_truth_patch, relevant_context):
+    explanation_prompt = f"""Hi, I need you to explain to me why the following pull request fix the related github issue on a python repository {repo}. 
+You will be given the issue description, the ground truth patch and relevant contexts.
+Your job is to go across each git diff patch and explain to me the purpose of each modification and how it relates to fixing the issue.
+
+### Issue description
+{issue_description}
+
+
+### Ground truth patches
+{ground_truth_patch}
+
+
+### Relevant contexts
+{relevant_context}
+
+
+Bear in mind that the ground truth patches provided passed the related unit tests and therefore its correctness is guaranteed.
+Please provide your answer in the following format:
+
+Explanation on Modification 1: [For the first modification, explain the significance of the modification location and contrast the code behavior before and after the change.]
+Explanation on Modification 2: [For the second modification, explain the significance of the modification location and contrast the code behavior before and after the change.]
+...
+Summary: [Insert an overall summary of why the above modifications jointly fix the issue.]
+"""
+    return explanation_prompt
 
 
 def prepare_issue_prompt(problem_stmt: str) -> str:
@@ -439,10 +467,43 @@ def start_conversation_round_state_machine(
     return True
 
 
+def get_patch_explanation(fix_patch:str, api_manager: ProjectApiManager) -> dict:    
+    patch_info_list = parse_git_patch(fix_patch)
+    relevant_context = ""
+    for patch_info in patch_info_list:
+        file_name = patch_info["original_file_path"]
+        hunk_context = patch_info["hunk_context"]
+        # ZZ: TODO expand this to more cases ....
+        if hunk_context.startswith("def "):
+            method_name = hunk_context.split("def ")[1].split("(")[0]
+            intent = FunctionCallIntent("search_method_in_file", {
+                "method_name": method_name, "file_name": file_name}, None)
+            detailed_result, succint_result, found = api_manager.dispatch_intent(intent, None)
+        elif hunk_context.startswith("class "):
+            class_name = hunk_context.split("class ")[1].split("(")[0]
+            intent = FunctionCallIntent("search_class_in_file", {
+                "class_name": class_name, "file_name": file_name}, None)
+            detailed_result, succint_result, found = api_manager.dispatch_intent(intent, None)
+        elif not hunk_context:
+            # TODO can we support search by chunk here ? 
+            intent = FunctionCallIntent("search_code_in_file", {
+                "code_str": patch_info['original_hunk_lines'][0], "file_name": file_name}, None)
+            detailed_result, succint_result, found = api_manager.dispatch_intent(intent, None)
+        else:
+            # TODO: simply ignore this ?
+            continue
+        relevant_context += detailed_result
+    exp_prompt = prepare_explanation_prompt(repo_name, problem_statement, fix_patch, relevant_context)
+    explanation_result, *_ = common.CRITIC_MODEL.call([{"role": "user", "content": exp_prompt}])
+    return {"prompt": exp_prompt, "response": explanation_result}
+
+
 def run_one_task(
     output_dir: str,
     api_manager: ProjectApiManager,
     problem_stmt: str,
+    fix_patch: str,
+    repo_name: str,
     print_callback: Callable[[dict], None] | None = None,
 ) -> bool:
     """
@@ -452,6 +513,10 @@ def run_one_task(
         api_manager (ProjectApiManager): The already-initialized API manager.
         problem_stmt (str): The original problem statement submitted to the task issue.
     """
+    # ZZ: Get explanation for critic model first 
+    print_banner("Collecting explanations for the issue")
+    exp_prompt_res = get_patch_explanation(fix_patch, api_manager)
+    
     print_banner("Starting AutoCodeRover on the following issue")
     print_issue(problem_stmt)
     msg_thread = MessageThread()

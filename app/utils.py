@@ -1,7 +1,7 @@
 import ast
 import contextlib
 import glob
-import os
+import os, re
 import subprocess
 from os.path import dirname as pdirname
 from os.path import join as pjoin
@@ -9,6 +9,59 @@ from pathlib import Path
 from subprocess import CalledProcessError
 
 from app.log import log_and_print
+
+
+def parse_git_patch(patch):
+    results = []
+    
+    # Regex to capture the file names and hunk information
+    file_pattern = re.compile(r'diff --git a/(.+) b/(.+)')
+    hunk_pattern = re.compile(r'@@ -(\d+),(\d+) \+(\d+),(\d+) @@(?: (.*))?')
+
+    # Split the patch by 'diff --git' to handle each file separately
+    file_match_locs = [m for m in re.finditer(file_pattern, patch)]
+    for f_m_idx, f_match in enumerate(file_match_locs):
+        file_start_idx = f_match.start()
+        file_end_idx = file_match_locs[f_m_idx+1].start() if (f_m_idx+1) < len(file_match_locs) else None
+        modified_file_content = patch[file_start_idx:file_end_idx]
+        # get match file path info
+        orig_file_path, new_file_path = f_match.groups() 
+        # split each modified file by the git patch header
+        hunk_match_locs =  [m for m in re.finditer(hunk_pattern, modified_file_content)]
+        for h_m_idx, h_match in enumerate(hunk_match_locs):
+            hunk_start_idx = h_match.start()
+            hunk_end_idx = hunk_match_locs[h_m_idx+1].start() if (h_m_idx+1) < len(hunk_match_locs) else None
+            modified_hunk_content = modified_file_content[hunk_start_idx:hunk_end_idx]
+            # Get the hunk header info 
+            orig_start_line, orig_line_count, new_start_line, new_line_count, hunk_context = re.findall(hunk_pattern, modified_hunk_content)[0]
+            # get original and new content
+            hunk_lines = modified_file_content[h_match.end(): hunk_end_idx].split('\n')
+            orig_hunk_lines, new_hunk_lines = [], []
+            for line in hunk_lines:
+                if line == '\\ No newline at end of file': continue # ignore the format string added by git
+                if line and not line.startswith('+'):
+                    if line.startswith('-'):
+                        orig_hunk_lines.append(line[1:])
+                    else:
+                        orig_hunk_lines.append(line)
+                if line and not line.startswith('-'):
+                    if line.startswith('+'):
+                        new_hunk_lines.append(line[1:])
+                    else:
+                        new_hunk_lines.append(line)
+            results.append({
+                "original_file_path": orig_file_path,
+                "new_file_path": new_file_path,
+                "original_start_line": orig_start_line,
+                "new_start_line": new_start_line,
+                "hunk_context": hunk_context,
+                "original_hunk_lines": orig_hunk_lines,
+                "new_hunk_lines": new_hunk_lines,
+                "original_line_count":orig_line_count,
+                "new_line_count": new_line_count,
+                "hunk_content": modified_hunk_content
+            })
+    return results
 
 
 @contextlib.contextmanager

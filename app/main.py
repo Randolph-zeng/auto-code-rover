@@ -77,8 +77,8 @@ def main(args, subparser_dest_attr_name: str = "command"):
     print_stdout: bool = not args.no_print
     log.print_stdout = print_stdout
     # model related
-    common.set_model(args.actor_model, args.critic_model, args.actor_model_api_key, args.actor_model_base_url,
-                     args.critic_model_api_key, args.critic_model_base_url)
+    common.set_model(args.actor_model, args.actor_model_api_key, args.actor_model_base_url, args.actor_model_temperature,
+                     args.critic_model, args.critic_model_api_key, args.critic_model_base_url, args.critic_model_temperature)
     # FIXME: make temperature part of the Model class
     common.ACTOR_MODEL_TEMP, common.CRITIC_MODEL_TEMP  = args.actor_model_temperature, args.critic_model_temperature
     # acr related
@@ -552,6 +552,8 @@ def do_inference(
                 api_manager.output_dir,
                 api_manager,
                 python_task.get_issue_statement(),
+                python_task.fix_patch,
+                python_task.repo_name,
                 print_callback,
             )
 

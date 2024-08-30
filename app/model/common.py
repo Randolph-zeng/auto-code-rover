@@ -190,17 +190,19 @@ def get_all_model_names():
 ACTOR_MODEL: Model
 CRITIC_MODEL: Model
 
-def set_model(actor_model_name: str, critic_model_name: str, actor_api_key: str,
-              actor_base_url: str, critic_api_key: str, critic_base_url: str):
+def set_model(actor_model_name: str, actor_api_key: str,
+              actor_base_url: str, actor_temp: float, 
+              critic_model_name: str, critic_api_key: str, 
+              critic_base_url: str, critic_temp: float):
     global ACTOR_MODEL
     global CRITIC_MODEL
     ACTOR_MODEL = MODEL_HUB[actor_model_name]
     CRITIC_MODEL = MODEL_HUB[critic_model_name]    
-    ACTOR_MODEL.setup(actor_api_key, actor_base_url)
-    CRITIC_MODEL.setup(critic_api_key, critic_base_url)
+    ACTOR_MODEL.setup(actor_api_key, actor_base_url, actor_temp)
+    CRITIC_MODEL.setup(critic_api_key, critic_base_url, critic_temp)
 
 
-# the model temperature to use
+# the model temperature to use, TODO make this part of the model 
 # For OpenAI models: this value should be from 0 to 2
 ACTOR_MODEL_TEMP: float = 0.0
 CRITIC_MODEL_TEMP: float= 0.0

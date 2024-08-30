@@ -55,8 +55,9 @@ class OpenaiModel(Model):
         # client for making request
         self.client: OpenAI | None = None
         self._initialized = True
+        self.temperature = 0
 
-    def setup(self, api_key:str=None, base_url:str=None) -> None:
+    def setup(self, api_key:str=None, base_url:str=None, temp:float=None) -> None:
         """
         Check API key, base url, and initialize OpenAI client. The stop token ids are set because some open-sourced models did not define its eos-token well
         """
@@ -64,6 +65,7 @@ class OpenaiModel(Model):
             eval_api_key = api_key if api_key else self.check_api_key()
             eval_base_url = base_url if base_url else self.check_base_url()
             self.client = OpenAI(base_url=eval_base_url, api_key=eval_api_key)
+            self.temperature = temp
         stop_token_ids = os.getenv("VLLM_STOP_TOKEN_IDS", "")
         if stop_token_ids:
             stop_token_ids = [int(sid) for sid in stop_token_ids.split(',')]
@@ -140,7 +142,7 @@ class OpenaiModel(Model):
             response: ChatCompletion = self.client.chat.completions.create(
                 model=self.name,
                 messages=messages,  # type: ignore
-                temperature=common.MODEL_TEMP,
+                temperature=self.temperature,
                 response_format=ResponseFormat(type=response_format),
                 max_tokens=None,
                 top_p=top_p,
