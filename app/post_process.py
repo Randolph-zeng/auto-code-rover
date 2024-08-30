@@ -424,7 +424,7 @@ def extract_swe_bench_input(dir: str):
         task_id = meta["task_id"]
         this_result = {}
         this_result["instance_id"] = task_id
-        this_result["model_name_or_path"] = common.SELECTED_MODEL.name
+        this_result["model_name_or_path"] = common.ACTOR_MODEL.name
         with open(diff_file) as f:
             diff_content = f.read()
         if not diff_content:

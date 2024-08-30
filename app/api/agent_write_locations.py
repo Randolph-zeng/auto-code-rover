@@ -87,7 +87,7 @@ def run_with_retries(
         raw_location_file = pjoin(output_dir, f"agent_loc_list_{i}")
 
         # actually calling model
-        res_text, *_ = common.SELECTED_MODEL.call(new_thread.to_msg())
+        res_text, *_ = common.ACTOR_MODEL.call(new_thread.to_msg())
 
         new_thread.add_model(res_text, [])  # no tools
 

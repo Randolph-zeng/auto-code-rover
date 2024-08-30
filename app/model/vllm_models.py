@@ -56,13 +56,13 @@ class OpenaiModel(Model):
         self.client: OpenAI | None = None
         self._initialized = True
 
-    def setup(self) -> None:
+    def setup(self, api_key:str=None, base_url:str=None) -> None:
         """
         Check API key, base url, and initialize OpenAI client. The stop token ids are set because some open-sourced models did not define its eos-token well
         """
         if self.client is None:
-            eval_api_key = self.check_api_key()
-            eval_base_url = self.check_base_url()
+            eval_api_key = api_key if api_key else self.check_api_key()
+            eval_base_url = base_url if base_url else self.check_base_url()
             self.client = OpenAI(base_url=eval_base_url, api_key=eval_api_key)
         stop_token_ids = os.getenv("VLLM_STOP_TOKEN_IDS", "")
         if stop_token_ids:
@@ -201,6 +201,6 @@ class DeepseekCoderV2_16B_vllm(OpenaiModel):
 class DeepseekCoderV2_API(OpenaiModel):
     def __init__(self):
         super().__init__(
-            "deepseek-coder", 0., 0., parallel_tool_call=True
+            "deepseek-coder", 0.00000014, 0.00000028, parallel_tool_call=True
         )
-        self.note = "DeepSeek-Coder-API served in openai style. Cost per input/output assumed to be zero."
+        self.note = "DeepSeek-Coder-API served in openai style."

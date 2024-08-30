@@ -117,7 +117,7 @@ def start_conversation_round_stratified(
             print_callback=print_callback,
         )
 
-        res_text, *_ = common.SELECTED_MODEL.call(msg_thread.to_msg())
+        res_text, *_ = common.ACTOR_MODEL.call(msg_thread.to_msg())
         msg_thread.add_model(res_text, tools=[])
         print_retrieval(res_text, f"round {round_no}", print_callback=print_callback)
 
@@ -235,7 +235,7 @@ def start_conversation_round_stratified(
             msg, f"context retrieval round {round_no}", print_callback=print_callback
         )
 
-        res_text, *_ = common.SELECTED_MODEL.call(msg_thread.to_msg())
+        res_text, *_ = common.ACTOR_MODEL.call(msg_thread.to_msg())
         msg_thread.add_model(res_text, tools=[])
         print_retrieval(res_text, f"round {round_no}", print_callback=print_callback)
 
@@ -245,7 +245,7 @@ def start_conversation_round_stratified(
                 "\n- do we need more context: construct search API calls to get more context of the project. (leave it empty if you don't need more context)"
                 "\n- where are bug locations: buggy files and methods. (leave it empty if you don't have enough information)"
             )
-            if isinstance(common.SELECTED_MODEL, ollama.OllamaModel):
+            if isinstance(common.ACTOR_MODEL, ollama.OllamaModel):
                 # llama models tend to always output search APIs and buggy locations.
                 msg += "\n\nNOTE: If you have already identified the bug locations, do not make any search API calls."
             msg_thread.add_user(msg)
@@ -381,7 +381,7 @@ def start_conversation_round_state_machine(
         log_and_cprint(f"Allowed next tool states: {allowed_tools}", style="yellow")
 
         # create a new iteration of conversation
-        res_text, raw_tool_calls, func_call_intents, *_ = common.SELECTED_MODEL.call(
+        res_text, raw_tool_calls, func_call_intents, *_ = common.ACTOR_MODEL.call(
             msg_thread.to_msg(), tools=tools
         )
         log_and_print(
@@ -446,7 +446,7 @@ def run_one_task(
     print_callback: Callable[[dict], None] | None = None,
 ) -> bool:
     """
-    Main entry point to run inference on one task.
+    Main entry point to run inference on one task with rejection sampling to collect success trajectories.
     Args:
         output_dir (str): Path to the output directory.
         api_manager (ProjectApiManager): The already-initialized API manager.
@@ -457,7 +457,7 @@ def run_one_task(
     msg_thread = MessageThread()
 
     system_prompt = SYSTEM_PROMPT
-    if (not globals.enable_layered) and common.SELECTED_MODEL.parallel_tool_call:
+    if (not globals.enable_layered) and common.ACTOR_MODEL.parallel_tool_call:
         # these models support parallel tool calls, let's try to make them not do it
         system_prompt += " In your response, DO NOT make more than one tool call."
 

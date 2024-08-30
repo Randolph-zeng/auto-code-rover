@@ -187,35 +187,20 @@ def get_all_model_names():
 
 
 # To be set at runtime - the selected model for a run
-SELECTED_MODEL: Model
+ACTOR_MODEL: Model
+CRITIC_MODEL: Model
 
-
-def set_model(model_name: str):
-    global SELECTED_MODEL
-    if model_name not in MODEL_HUB and not model_name.startswith("litellm-generic-"):
-        print(f"Invalid model name: {model_name}")
-        sys.exit(1)
-    if model_name.startswith("litellm-generic-"):
-        prompt_tokens = 5
-        completion_tokens = 10
-        prompt_tokens_cost_usd_dollar, completion_tokens_cost_usd_dollar = (
-            cost_per_token(
-                model="gpt-3.5-turbo",
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-            )
-        )
-        litellm.set_verbose = True
-        SELECTED_MODEL = LiteLLMGeneric(
-            model_name.removeprefix("litellm-generic-"),
-            prompt_tokens_cost_usd_dollar,
-            completion_tokens_cost_usd_dollar,
-        )
-    else:
-        SELECTED_MODEL = MODEL_HUB[model_name]
-    SELECTED_MODEL.setup()
+def set_model(actor_model_name: str, critic_model_name: str, actor_api_key: str,
+              actor_base_url: str, critic_api_key: str, critic_base_url: str):
+    global ACTOR_MODEL
+    global CRITIC_MODEL
+    ACTOR_MODEL = MODEL_HUB[actor_model_name]
+    CRITIC_MODEL = MODEL_HUB[critic_model_name]    
+    ACTOR_MODEL.setup(actor_api_key, actor_base_url)
+    CRITIC_MODEL.setup(critic_api_key, critic_base_url)
 
 
 # the model temperature to use
 # For OpenAI models: this value should be from 0 to 2
-MODEL_TEMP: float = 0.0
+ACTOR_MODEL_TEMP: float = 0.0
+CRITIC_MODEL_TEMP: float= 0.0

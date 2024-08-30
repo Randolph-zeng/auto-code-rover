@@ -77,9 +77,10 @@ def main(args, subparser_dest_attr_name: str = "command"):
     print_stdout: bool = not args.no_print
     log.print_stdout = print_stdout
     # model related
-    common.set_model(args.model)
+    common.set_model(args.actor_model, args.critic_model, args.actor_model_api_key, args.actor_model_base_url,
+                     args.critic_model_api_key, args.critic_model_base_url)
     # FIXME: make temperature part of the Model class
-    common.MODEL_TEMP = args.model_temperature
+    common.ACTOR_MODEL_TEMP, common.CRITIC_MODEL_TEMP  = args.actor_model_temperature, args.critic_model_temperature
     # acr related
     globals.conv_round_limit = args.conv_round_limit
     globals.enable_layered = args.enable_layered
@@ -197,16 +198,52 @@ def add_task_related_args(parser: ArgumentParser) -> None:
         raise TypeError(f"Invalid model name: {name}")
 
     parser.add_argument(
-        "--model",
+        "--actor-model",
         type=model_parser,
         default="gpt-3.5-turbo-0125",
-        help="The model to use. Currently only OpenAI models are supported.",
+        help="The actor model that performs trajectory collection.",
     )
     parser.add_argument(
-        "--model-temperature",
+        "--critic-model",
+        type=model_parser,
+        default="gpt-3.5-turbo-0125",
+        help="The critic model that provides action feedback.",
+    )
+    parser.add_argument(
+        "--actor-model-api-key",
+        type=model_parser,
+        default="placeholder",
+        help="The api key for the actor model.",
+    )
+    parser.add_argument(
+        "--critic-model-api-key",
+        type=model_parser,
+        default="sk-xxxxx",
+        help="The api key for the critic model.",
+    )
+    parser.add_argument(
+        "--actor-model-base-url",
+        type=model_parser,
+        default="",
+        help="The base url for the actor model.",
+    )
+    parser.add_argument(
+        "--critic-model-base-url",
+        type=model_parser,
+        default="",
+        help="The base url for the critic model.",
+    )
+    parser.add_argument(
+        "--actor-model-temperature",
         type=float,
         default=0.0,
-        help="The model temperature to use, for OpenAI models.",
+        help="The model temperature to use, for actor model.",
+    )
+    parser.add_argument(
+        "--critic-model-temperature",
+        type=float,
+        default=0.0,
+        help="The model temperature to use, for critic model.",
     )
     parser.add_argument(
         "--conv-round-limit",
@@ -531,7 +568,8 @@ def do_inference(
 
 
 def dump_cost(start_time: datetime, end_time: datetime, task_output_dir: str):
-    model_stats = common.SELECTED_MODEL.get_overall_exec_stats()
+    # ZZ: assume actor model is served locally and ignore its cost 
+    model_stats = common.CRITIC_MODEL.get_overall_exec_stats()
     stats = {
         "commit": apputils.get_current_commit_hash(),
         "start_epoch": start_time.timestamp(),

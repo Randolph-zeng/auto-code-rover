@@ -77,7 +77,7 @@ def run(text: str) -> tuple[str, MessageThread]:
     msg_thread = MessageThread()
     msg_thread.add_system(PROXY_PROMPT)
     msg_thread.add_user(text)
-    res_text, *_ = common.SELECTED_MODEL.call(
+    res_text, *_ = common.ACTOR_MODEL.call(
         msg_thread.to_msg(), response_format="json_object"
     )
 

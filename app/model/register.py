@@ -51,4 +51,4 @@ def register_all_models() -> None:
     common.register_model(vllm_models.DeepseekCoderV2_API())
 
     # register default model as selected
-    common.SELECTED_MODEL = gpt.Gpt35_Turbo0125()
+    # common.ACTOR_MODEL = gpt.Gpt35_Turbo0125()
