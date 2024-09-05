@@ -66,7 +66,13 @@ class MessageThread:
     """
 
     def __init__(self, messages=None):
+        """
+        ZZ: the self.messages stores the messages sent to LLMs and contains only single thread.
+        The full_messages on the other hand stores the trajectories that contains all the k samples in each rejection sampling
+        stage, and also includes the responses from critic models. 
+        """
         self.messages: list[dict] = messages or []
+        self.full_messages: list[dict] = messages or []
 
     def add(self, role: str, message: str):
         """
@@ -76,16 +82,20 @@ class MessageThread:
             role (str): The role of the new message.
         """
         self.messages.append({"role": role, "content": message})
+        self.full_messages.append({"role": role, "content": message})
 
     def add_system(self, message: str):
         self.messages.append({"role": "system", "content": message})
+        self.full_messages.append({"role": "system", "content": message})
 
     def add_user(self, message: str):
         self.messages.append({"role": "user", "content": message})
+        self.full_messages.append({"role": "system", "content": message})
 
     def add_tool(self, message: str, tool_call_id: str):
         m = {"role": "tool", "content": message, "tool_call_id": tool_call_id}
         self.messages.append(m)
+        self.full_messages.append(m)
 
     def add_model(
         self, message: str | None, tools: list[ChatCompletionMessageToolCall]
@@ -102,7 +112,7 @@ class MessageThread:
             func_name: str = func_obj.name
             this_tool_dict["function"] = {"name": func_name, "arguments": func_args}
             json_tools.append(this_tool_dict)
-
+        # ZZ: the full_messages shall have its own add_model logic
         if json_tools == []:
             # there is no tool calls from the model last time,
             # the best we could do is to return the generated text
@@ -111,6 +121,12 @@ class MessageThread:
             self.messages.append(
                 {"role": "assistant", "content": None, "tool_calls": json_tools}
             )
+
+    def add_rejection_sampled_messages(self, actor_critic_response_list):
+        """
+        ZZ: Add n pairs of sampled actor/critic model responses 
+        """
+        self.full_messages.append({"actor_critic_pairs": [info for info in actor_critic_response_list]})
 
     def to_msg(self) -> list[dict]:
         """
@@ -130,7 +146,10 @@ class MessageThread:
             file_path (str): The path to the file.
         """
         with open(file_path, "w") as f:
-            json.dump(self.messages, f, indent=4)
+            json.dump({
+                "chosen_trajectory": self.messages,
+                "full_trajectory": self.full_messages
+            }, f, indent=4)
 
     def get_round_number(self) -> int:
         """

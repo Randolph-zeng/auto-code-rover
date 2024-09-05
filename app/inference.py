@@ -7,7 +7,7 @@ from pathlib import Path
 
 from loguru import logger
 from termcolor import colored
-
+from concurrent.futures import ThreadPoolExecutor
 from app import globals
 from app.api.manage import ProjectApiManager
 from app.data_structures import FunctionCallIntent, MessageThread
@@ -28,6 +28,11 @@ SYSTEM_PROMPT = """You are a software developer maintaining a large project.
 You are working on an issue submitted to your project.
 The issue contains a description marked between <issue> and </issue>.
 Your task is to invoke a few search API calls to gather buggy information, then write patches to solve the issues.
+"""
+
+# FIXME: Adjust the response according to the parsing rule of search actions 
+DEFAULT_CRITIC_RESPONSE = """Failed to parse the search actions out of the response. The search action generated might not be following the instructions given. 
+Please check your response and follow the **exact** format desired.    
 """
 
 
@@ -96,9 +101,137 @@ def add_step_trigger(orig_prompt: str, is_first: bool = False) -> str:
     return orig_prompt + "\n" + trigger
 
 
+def proxy_apis_helper(api_manager, res_text):
+    selected_apis, _, proxy_threads = api_manager.proxy_apis(res_text)
+    return selected_apis, res_text     
+
+
+def actor_model_helper(messages):
+    res_text, cost, input_tokens, output_tokens = common.ACTOR_MODEL.call(messages)
+    return (res_text, cost, input_tokens, output_tokens)
+    
+
+def search_action_critic_helper(correct_call_info, critic_msg_thread):
+    # ZZ: format critic prompt and send to critic models  
+    critic_prompt= f"""Given the information above, can you help me to determine how relevant the following search actions is to the pull request we are dealing with?  
+Specifically, you need to decide which of the following states each search action belongs to:
+
+Relevant: The code context retrieved is DIRECTLY relevant to the pull request and having knowledge about this code context is necessary to understand why the issue happens. 
+Neutral: The retrieved code context is somewhat pertaining to the pull request, however it is not a necessary information to analyse the underlying error upon.  
+Unrelated: The code context retrieved is completely irrelevant and helpless to solve the pull request. It is safe to disregard this code context. 
+Imprecise: The search action is not precise. This includes situations (1) Searching for code that are outside the scope of the current repoistory; (2) Searching with incorrect arguments (3) Searching with vague and imprecise arguments leading to too many results.   
+
+### Search Actions 
+{correct_call_info['collated_tool_response']}
+
+**Please answer in the following format**:
+Search Action 1: [Insert a brief analysis on the relevance of the first search action here.]
+Category: [Insert only 'Relevant', 'Neutral', 'Unrelated' or 'Imprecise' here.]
+Search Action 2: [Insert a brief analysis on the relevance of the second search action here.]
+Category: [Insert only 'Relevant', 'Neutral', 'Unrelated' or 'Imprecise' here.]
+...
+"""
+    relevant_thread = critic_msg_thread + [{"role": 'user', 'content':critic_prompt}]
+    res_text, cost, input_tokens, output_tokens = common.CRITIC_MODEL.call(relevant_thread)
+    categories = re.findall(r'Category: (\w+)', res_text)
+    # ZZ: TODO How do we assign scores to the actions. Average or Best? What is the score for each category?
+    category_mapper = {
+        'relevant': 1, 'neutral': 0.5, 'unrelated': 0, 'imprecise': -0.2
+    }
+    acc_score, success_cat_num = 0, 0 
+    for cat in categories:
+        if cat.lower() in category_mapper: 
+            acc_score += category_mapper[cat.lower()]  
+            success_cat_num += 1
+    avg_score = acc_score/success_cat_num if success_cat_num else 0
+    correct_call_info["critic_prompt"] = critic_prompt
+    correct_call_info["critic_response"] = res_text
+    correct_call_info["reward"] = avg_score
+    correct_call_info["selected"] = False
+    return (correct_call_info, cost, input_tokens, output_tokens)
+    
+    
+def search_analysis_critic_helper(actor_res, selected_critic_info, critic_msg_thread):
+    critic_prompt = f"""Given the information above, can you help me to determine if the following search analysis on the search results make sense or not?  
+Specifically, for each search result there will be a corresponding analysis on its functionality and if it is the bug location.
+Your job is to (1) decide if the analysis on the functionality within the code execution chain is reasonable or not and (2) decide if the determination of bug location is correct or not.
+
+### Search Analysis 
+{actor_res}
+
+**Please answer in the following format**:
+Search Analysis Review 1: [Insert a brief reasoning on the correctness of the first analysis on the functionality and bug location here.]
+Functionality Correctness 1: [Insert only 'correct' or 'incorrect' here.]
+Bug Location Correctness 1: [Insert only 'correct' or 'incorrect' here.]
+
+Search Analysis Review 2: [Insert a brief reasoning on the correctness of the second analysis on the functionality and bug location here.]
+Functionality Correctness 2: [Insert only 'correct' or 'incorrect' here.]
+Bug Location Correctness 2: [Insert only 'correct' or 'incorrect' here.]
+...
+"""
+    relevant_thread = critic_msg_thread + [
+        {"role": 'user', 'content':selected_critic_info['critic_prompt']},
+        {"role": 'assistant', 'content':selected_critic_info['critic_response']}
+        {"role": 'user', 'content':critic_prompt}
+    ]
+    res_text, cost, input_tokens, output_tokens = common.CRITIC_MODEL.call(relevant_thread)
+    pattern = r'Functionality Correctness \d+: (\w+)\nBug Location Correctness \d+: (\w+)'
+    matches = re.findall(pattern, res_text)
+    acc_score, action_count = 0
+    for i, (functionality, bug_location) in enumerate(matches, start=1):
+        # ZZ: TODO be careful about the rewards given to functionality analysis and bug location analysis 
+        # ZZ: if any of the bug location is incorrect ... should we simply disregard this analysis ???
+        action_count += 1
+        if functionality.strip().lower() == 'correct': 
+            acc_score += 0.5
+        else:
+            acc_score -= 1
+        if bug_location.strip().lower() == 'correct': 
+            acc_score += 1
+        else:
+            acc_score -= 2 
+    reward = acc_score/action_count if action_count != 0 else 0
+    analysis_info = {
+        "actor_response": actor_res,
+        'critic_prompt': critic_prompt,
+        "critic_response": res_text, 
+        "reward": reward,  
+        'selected': False
+    }
+    return (analysis_info, cost, input_tokens, output_tokens)
+    
+
+    
+def print_selected_search_action_results(selected_apis_json, collated_tool_response, round_no, print_callback):
+    json_api_calls = selected_apis_json.get("API_calls", [])
+    buggy_locations = selected_apis_json.get("bug_locations", [])
+    formatted = []
+    if json_api_calls:
+        formatted.append("API calls:")
+        for call in json_api_calls:
+            formatted.extend([f"\n- `{call}`"])
+    if buggy_locations:
+        formatted.append("\n\nBug locations")
+        for location in buggy_locations:
+            s = ", ".join(f"{k}: `{v}`" for k, v in location.items())
+            formatted.extend([f"\n- {s}"])
+    print_acr(
+        "\n".join(formatted),
+        "Agent-selected API calls",
+        print_callback=print_callback,
+    )
+    print_acr(
+        collated_tool_response,
+        f"context retrieval round {round_no}",
+        print_callback=print_callback,
+    )
+    return json_api_calls, buggy_locations
+    
+
 def start_conversation_round_stratified(
     output_dir: str,
-    msg_thread: MessageThread,
+    actor_msg_thread: MessageThread,
+    critic_msg_thread: MessageThread,
     api_manager: ProjectApiManager,
     start_round_no: int = 0,
     print_callback: Callable[[dict], None] | None = None,
@@ -107,6 +240,7 @@ def start_conversation_round_stratified(
     This version uses json data to process API calls, instead of using the OpenAI function calling.
     Advantage is that multiple API calls can be made in a single round.
     """
+    # ZZ: TODO specify the return format in here so that we can avoid the unnecessary api calls 
     prompt = (
         "Based on the files, classes, methods, and code statements from the issue related to the bug, you can use the following search APIs to get more context of the project."
         "\n- search_class(class_name: str): Search for a class in the codebase"
@@ -118,24 +252,18 @@ def start_conversation_round_stratified(
         "\n\nNote that you can use multiple search APIs in one round."
         "\n\nNow analyze the issue and select necessary APIs to get more context of the project. Each API call must have concrete arguments as inputs."
     )
-    msg_thread.add_user(prompt)
+    actor_msg_thread.add_user(prompt)
 
     round_no = start_round_no
 
     round_count = range(start_round_no, globals.conv_round_limit + 1)
-
-    try_generate_locs = False
-    if globals.disable_patch_generation:
-        round_count = range(
-            start_round_no, start_round_no + globals.context_generation_limit + 1
-        )
 
     for round_no in round_count:
         api_manager.start_new_tool_call_layer()
 
         conversation_file = pjoin(output_dir, f"conversation_round_{round_no}.json")
         # save current state before starting a new round
-        msg_thread.save_to_file(conversation_file)
+        actor_msg_thread.save_to_file(conversation_file)
 
         print_banner(f"CONTEXT RETRIEVAL ROUND {round_no}")
 
@@ -144,60 +272,89 @@ def start_conversation_round_stratified(
             f"context retrieval round {start_round_no}",
             print_callback=print_callback,
         )
+        # ZZ: perform batch inference here so that we can apply rejection sampling, note res_text is a list and need special handling
+        with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
+            futures = list(executor.map(lambda x: actor_model_helper(actor_msg_thread.to_msg()), range(globals.rejection_sampling_k)))
+        res_text_list = [f[0] for f in futures]
+        common.thread_cost.process_cost += sum([f[1] for f in futures])
+        common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
+        common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+        
+        # ZZ: proxy api extract the search action in json format. We make a parallel call here for all the different res_texts generated 
+        with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
+            futures = list(executor.map(lambda res_text: proxy_apis_helper(api_manager, res_text), res_text_list))
+            # ZZ: TODO Modify the search action call and therefore get rid of this proxy apis call. This is indirect and unnecessary !
+        
+        # ZZ: Categorize each search attempt into correct and incorrect calls 
+        correct_tool_calls, incorrect_tool_calls = [], [] 
+        for parsed_apis, res_text in futures:
+            if parsed_apis is None:
+                incorrect_tool_calls.append({
+                    "actor_response": res_text,
+                    'parsed_apis': parsed_apis,
+                    "collated_tool_response": "",
+                    'critic_prompt': '',
+                    "critic_response": DEFAULT_CRITIC_RESPONSE, # ZZ: provide a default critic feedback to failed actions 
+                    "reward": -1,  # ZZ: by default we give -1 to actions not following the desired format ?
+                    'selected': False
+                })
+            else:
+                # ZZ: for search actions successfully parsed, we should collect related contexts, send to critic models to get feedbacks  
+                apis_json = json.loads(parsed_apis)
+                curr_json_api_calls = apis_json.get("API_calls", [])
+                # prepare response from tools
+                collated_tool_response = ""
+                for api_call in curr_json_api_calls:
+                    func_name, func_args = parse_function_invocation(api_call)
 
-        res_text, *_ = common.ACTOR_MODEL.call(msg_thread.to_msg())
-        msg_thread.add_model(res_text, tools=[])
-        print_retrieval(res_text, f"round {round_no}", print_callback=print_callback)
+                    arg_spec = inspect.getfullargspec(getattr(SearchManager, func_name))
+                    arg_names = arg_spec.args[1:]  # first parameter is self
 
-        selected_apis, _, proxy_threads = api_manager.proxy_apis(res_text)
+                    assert len(func_args) == len(
+                        arg_names
+                    ), f"Number of argument is wrong in API call: {api_call}"
 
-        proxy_log = Path(output_dir, f"agent_proxy_{round_no}.json")
-        proxy_messages = [thread.to_msg() for thread in proxy_threads]
-        proxy_log.write_text(json.dumps(proxy_messages, indent=4))
+                    kwargs = dict(zip(arg_names, func_args))
+                    intent = FunctionCallIntent(func_name, kwargs, None)
+                    tool_output, _, _ = api_manager.dispatch_intent(intent, actor_msg_thread)
 
-        if selected_apis is None:
-            msg = "The search API calls seem not valid. Please check the arguments you give carefully and try again."
-            msg_thread.add_user(msg)
-            print_acr(
-                msg,
-                f"context retrieval round {round_no}",
-                print_callback=print_callback,
-            )
-            continue
+                    collated_tool_response += f"Result of {api_call}:\n\n"
+                    collated_tool_response += tool_output + "\n\n"
+                # fill in the critic response and reward later
+                correct_tool_calls.append({
+                    "actor_response": res_text,
+                    "parsed_apis": parsed_apis,
+                    "collated_tool_response": collated_tool_response,
+                })
+        # ZZ: make parallel calls to critic models 
+        with ThreadPoolExecutor(max_workers=len(correct_tool_calls)) as executor:
+            futures = list(executor.map(lambda correct_call_info: search_action_critic_helper(correct_call_info, critic_msg_thread.to_msg()), correct_tool_calls))
+        common.thread_cost.process_cost += sum([f[1] for f in futures])
+        common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
+        common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+        
+        # ZZ: select the best search action to proceed
+        sorted_correct_tool_calls = sorted(correct_tool_calls, key=lambda x: x['reward'], reverse=True) 
+        sorted_correct_tool_calls[0]['selected'] = True
+        actor_msg_thread.add_model(sorted_correct_tool_calls[0]['actor_response'], tools=[])
+        actor_msg_thread.add_user(sorted_correct_tool_calls[0]['collated_tool_response'])
+        print_retrieval(sorted_correct_tool_calls[0]['actor_response'], f"round {round_no}", print_callback=print_callback)
+        
+        # ZZ: save the rejection sampling actor results and critic feedbacks
+        actor_msg_thread.add_rejection_sampled_messages(correct_tool_calls+incorrect_tool_calls)
 
-        selected_apis_json = json.loads(selected_apis)
-
-        json_api_calls = selected_apis_json.get("API_calls", [])
-        buggy_locations = selected_apis_json.get("bug_locations", [])
-
-        formatted = []
-        if json_api_calls:
-            formatted.append("API calls:")
-            for call in json_api_calls:
-                formatted.extend([f"\n- `{call}`"])
-
-        if buggy_locations:
-            formatted.append("\n\nBug locations")
-            for location in buggy_locations:
-                s = ", ".join(f"{k}: `{v}`" for k, v in location.items())
-                formatted.extend([f"\n- {s}"])
-            Path(output_dir, f"fix_locations_{round_no}.json").write_text(
-                json.dumps(buggy_locations, indent=4)
-            )
-
-        print_acr(
-            "\n".join(formatted),
-            "Agent-selected API calls",
-            print_callback=print_callback,
-        )
-
+        # ZZ: TODO Do we need to print this ? Or delete this logic ...
+        selected_apis_json = json.loads(sorted_correct_tool_calls[0]['parsed_apis'])
+        json_api_calls, buggy_locations = print_selected_search_action_results(selected_apis_json, 
+            sorted_correct_tool_calls[0]['collated_tool_response'], round_no, print_callback)
+        
         # collected enough information to write patch
         if buggy_locations and (not json_api_calls):
             collated_tool_response = "Here is the code in buggy locations:\n\n"
             # provide the buggy locations to the model
             for bug_location in buggy_locations:
                 tool_output, *_ = search_for_bug_location(
-                    api_manager, msg_thread, bug_location
+                    api_manager, actor_msg_thread, bug_location
                 )
                 collated_tool_response += f"\n\n{tool_output}\n"
 
@@ -205,24 +362,18 @@ def start_conversation_round_stratified(
                 "Unknown function" not in collated_tool_response
                 and "Could not" not in collated_tool_response
             ):
-                msg_thread.add_user(collated_tool_response)
-
-                if globals.disable_patch_generation:
-                    logger.debug(
-                        "Gathered enough information. Skipping patch generation due to feature flag."
-                    )
-                else:
-                    print_banner("PATCH GENERATION")
-                    logger.debug("Gathered enough information. Invoking write_patch.")
-                    print_acr(
-                        collated_tool_response,
-                        "patch generation round 1",
-                        print_callback=print_callback,
-                    )
+                actor_msg_thread.add_user(collated_tool_response)
+                print_banner("PATCH GENERATION")
+                logger.debug("Gathered enough information. Invoking write_patch.")
+                print_acr(
+                    collated_tool_response,
+                    "patch generation round 1",
+                    print_callback=print_callback,
+                )
                 break
 
             msg = "The buggy locations is not precise. You may need to check whether the arguments are correct and search more information."
-            msg_thread.add_user(msg)
+            actor_msg_thread.add_user(msg)
             print_acr(
                 msg,
                 f"context retrieval round {round_no}",
@@ -230,42 +381,47 @@ def start_conversation_round_stratified(
             )
             continue
 
-        # prepare response from tools
-        collated_tool_response = ""
+        
+        # ZZ: TODO specify the analysis directions and critic scoring fields 
+        msg = """Let's analyze collected context in the following desired format:
+Code Explanation 1: [For the first search result, briefly explain its functionalities.]
+Code Relevance 1: [For the first search result, what role does it play in the execution chain of the issue described? Is the bug directly located within this search result rather than nested in one of its related function calls?]   
+Is Bug Location 1: [Insert `true` or `false` here ONLY] 
 
-        for api_call in json_api_calls:
-            func_name, func_args = parse_function_invocation(api_call)
+Code Explanation 2: [For the second search result, briefly explain its functionalities.]
+Code Relevance 2: [For the second search result, what role does it play in the execution chain of the issue described? Is the bug directly located within this search result rather than nested in one of its related function calls?]   
+Is Bug Location 2: [Insert `true` or `false` here ONLY] 
 
-            arg_spec = inspect.getfullargspec(getattr(SearchManager, func_name))
-            arg_names = arg_spec.args[1:]  # first parameter is self
-
-            assert len(func_args) == len(
-                arg_names
-            ), f"Number of argument is wrong in API call: {api_call}"
-
-            kwargs = dict(zip(arg_names, func_args))
-            intent = FunctionCallIntent(func_name, kwargs, None)
-            tool_output, _, _ = api_manager.dispatch_intent(intent, msg_thread)
-
-            collated_tool_response += f"Result of {api_call}:\n\n"
-            collated_tool_response += tool_output + "\n\n"
-
-        msg_thread.add_user(collated_tool_response)
-        print_acr(
-            collated_tool_response,
-            f"context retrieval round {round_no}",
-            print_callback=print_callback,
-        )
-
-        msg = "Let's analyze collected context first"
-        msg_thread.add_user(msg)
+...
+"""
+        actor_msg_thread.add_user(msg)
         print_acr(
             msg, f"context retrieval round {round_no}", print_callback=print_callback
         )
+        with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
+            futures = list(executor.map(lambda x: actor_model_helper(actor_msg_thread.to_msg()), range(globals.rejection_sampling_k)))
+        res_text_list = [f[0] for f in futures]
+        common.thread_cost.process_cost += sum([f[1] for f in futures])
+        common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
+        common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
 
-        res_text, *_ = common.ACTOR_MODEL.call(msg_thread.to_msg())
-        msg_thread.add_model(res_text, tools=[])
+        # TODO: Do we really need to analyse the bug locations ? Or do we need k analysis ? 
+        with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
+            futures = list(executor.map(lambda res_text: search_analysis_critic_helper(res_text, 
+                sorted_correct_tool_calls[0], critic_msg_thread.to_msg()), res_text_list))
+        common.thread_cost.process_cost += sum([f[1] for f in futures])
+        common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
+        common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+        
+        # ZZ: select the best search analysis 
+        search_analysis_info_list = [f[0] for f in futures]
+        sorted_search_analysis_list = sorted(search_analysis_info_list, key=lambda x: x['reward'], reverse=True) 
+        sorted_search_analysis_list[0]['selected'] = True
+        actor_msg_thread.add_model(sorted_search_analysis_list[0]['actor_response'], tools=[])        
         print_retrieval(res_text, f"round {round_no}", print_callback=print_callback)
+
+        # ZZ: save the rejection sampling actor results and critic feedbacks
+        actor_msg_thread.add_rejection_sampled_messages(search_analysis_info_list)
 
         if round_no < globals.conv_round_limit:
             msg = (
@@ -276,45 +432,23 @@ def start_conversation_round_stratified(
             if isinstance(common.ACTOR_MODEL, ollama.OllamaModel):
                 # llama models tend to always output search APIs and buggy locations.
                 msg += "\n\nNOTE: If you have already identified the bug locations, do not make any search API calls."
-            msg_thread.add_user(msg)
+            actor_msg_thread.add_user(msg)
             print_acr(
                 msg,
                 f"context retrieval round {round_no}",
                 print_callback=print_callback,
             )
-    else:
-        log_msg = "Try writing patch anyway."
-        # TODO can be improved more
-        if globals.disable_patch_generation:
-            all_locs = []
-            for fix_location_file in Path(output_dir).glob("*fix_locations_*.json"):
-                all_locs += json.loads(Path(fix_location_file).read_text())
-            all_locs = list(set(map(json.dumps, all_locs)))
-            Path(output_dir, "fix_locations.json").write_text(
-                json.dumps(all_locs, indent=4)
-            )
-            try_generate_locs = all_locs != []
-            log_msg = "Try outputing some locations still."
-
-        logger.info(f"Too many rounds. {log_msg}")
 
     round_no += 1
-
-    if not globals.disable_patch_generation:
-        intent = FunctionCallIntent("write_patch", {}, None)
-    elif try_generate_locs:
-        intent = FunctionCallIntent("propose_locs", {}, None)
-    else:
-        intent = None
-
-    if intent:
-        api_manager.start_new_tool_call_layer()
-        api_manager.dispatch_intent(intent, msg_thread, print_callback=print_callback)
-        logger.info(f"Invoked {intent.func_name}.")
+    # TODO: We need to differentiate situations where contexts collected are enough versus conv rounds limit reached
+    intent = FunctionCallIntent("write_patch", {}, None)
+    api_manager.start_new_tool_call_layer()
+    api_manager.dispatch_intent(intent, actor_msg_thread, print_callback=print_callback)
+    logger.info(f"Invoked {intent.func_name}.")
 
     logger.info("Ending workflow.")
     conversation_file = pjoin(output_dir, f"conversation_round_{round_no}.json")
-    msg_thread.save_to_file(conversation_file)
+    actor_msg_thread.save_to_file(conversation_file)
 
     return True
 
@@ -495,7 +629,7 @@ def get_patch_explanation(fix_patch:str, api_manager: ProjectApiManager) -> dict
         relevant_context += detailed_result
     exp_prompt = prepare_explanation_prompt(repo_name, problem_statement, fix_patch, relevant_context)
     explanation_result, *_ = common.CRITIC_MODEL.call([{"role": "user", "content": exp_prompt}])
-    return {"prompt": exp_prompt, "response": explanation_result}
+    return exp_prompt, explanation_result
 
 
 def run_one_task(
@@ -515,20 +649,23 @@ def run_one_task(
     """
     # ZZ: Get explanation for critic model first 
     print_banner("Collecting explanations for the issue")
-    exp_prompt_res = get_patch_explanation(fix_patch, api_manager)
+    exp_prompt, explanation_result = get_patch_explanation(fix_patch, api_manager)
+    critic_msg_thread = MessageThread()
+    critic_msg_thread.add_user(exp_prompt)
+    critic_msg_thread.add_model(explanation_result, tools=[])
     
     print_banner("Starting AutoCodeRover on the following issue")
     print_issue(problem_stmt)
-    msg_thread = MessageThread()
+    actor_msg_thread = MessageThread()   
 
     system_prompt = SYSTEM_PROMPT
     if (not globals.enable_layered) and common.ACTOR_MODEL.parallel_tool_call:
         # these models support parallel tool calls, let's try to make them not do it
         system_prompt += " In your response, DO NOT make more than one tool call."
 
-    msg_thread.add_system(system_prompt)
+    actor_msg_thread.add_system(system_prompt)
     original_prompt = prepare_issue_prompt(problem_stmt)
-    msg_thread.add_user(original_prompt)
+    actor_msg_thread.add_user(original_prompt)
 
     # Add another user message about fault localization
     if globals.enable_sbfl:
@@ -536,15 +673,16 @@ def run_one_task(
         localization_prompt = "An external analysis tool has been deployed to identify the suspicious code to be fixed. You can choose to use the results from this tool, if you think they are useful."
         localization_prompt += "The tool output is as follows:\n"
         localization_prompt += localization_result
-        msg_thread.add_user(localization_prompt)
+        actor_msg_thread.add_user(localization_prompt)
 
     if globals.enable_layered:
         return start_conversation_round_stratified(
-            output_dir, msg_thread, api_manager, print_callback=print_callback
+            output_dir, actor_msg_thread, critic_msg_thread, api_manager, print_callback=print_callback
         )
     else:
+        # ZZ: let's ignore this branch since it necessitate more rounds of interactions and more tokens ... 
         return start_conversation_round_state_machine(
-            output_dir, msg_thread, api_manager
+            output_dir, actor_msg_thread, api_manager
         )
 
 

@@ -91,6 +91,7 @@ def main(args, subparser_dest_attr_name: str = "command"):
     globals.only_save_sbfl_result = args.save_sbfl_result
     globals.disable_patch_generation = args.output_fix_locs
     globals.context_generation_limit = args.output_fix_limit
+    globals.rejection_sampling_k = args.rejection_sampling_k
 
     subcommand = getattr(args, subparser_dest_attr_name)
     if subcommand == "swe-bench":
@@ -244,6 +245,12 @@ def add_task_related_args(parser: ArgumentParser) -> None:
         type=float,
         default=0.0,
         help="The model temperature to use, for critic model.",
+    )
+    parser.add_argument(
+        "--rejection-sampling-k",
+        type=int,
+        default=5,
+        help="The number of possible outcomes to sample at each step for rejection sampling.",
     )
     parser.add_argument(
         "--conv-round-limit",

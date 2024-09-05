@@ -35,3 +35,6 @@ disable_patch_generation: bool = False
 
 # Used with disable_patch_generation - constrains or extends the amount of context retrieval rounds
 context_generation_limit: int = -1
+
+# ZZ: The number of possible outcomes to sample at each step for rejection sampling.
+rejection_sampling_k: int = -1

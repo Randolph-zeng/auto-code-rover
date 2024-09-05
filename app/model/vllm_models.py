@@ -95,10 +95,13 @@ class OpenaiModel(Model):
         Given a chat completion message, extract the content from it.
         """
         content = chat_completion_message.content
-        if content is None:
-            return ""
-        else:
-            return content
+        content = "" if content is None else content
+        # ZZ: manual cleanning for json format 
+        if content.strip().startswith("```json") and content.strip().endswith("```"):
+            content = content.strip()[7:-4]
+        if content.strip().startswith("```") and content.strip().endswith("```"):
+            content = content.strip()[3:-4]
+        return content
 
     # FIXME: the returned type contains OpenAI specific Types, which should be avoided
     @retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
@@ -157,19 +160,10 @@ class OpenaiModel(Model):
             output_tokens = int(usage_stats.completion_tokens)
             cost = self.calc_cost(input_tokens, output_tokens)
 
-            common.thread_cost.process_cost += cost
-            common.thread_cost.process_input_tokens += input_tokens
-            common.thread_cost.process_output_tokens += output_tokens
-
             raw_response = response.choices[0].message
             # log_and_print(f"Raw model response: {raw_response}")
             content = self.extract_resp_content(raw_response)
-            if orig_res_fm == 'json_object':
-                # ZZ: manual cleanning for json format 
-                if content.strip().startswith("```json"):
-                    content = content.strip()[7:-4]
-                if content.strip().startswith("```"):
-                    content = content.strip()[3:-4]
+            
             return (
                 content,
                 cost,
