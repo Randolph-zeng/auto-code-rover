@@ -22,6 +22,7 @@ from app.log import (
 from app.model import common, ollama
 from app.search.search_manage import SearchManager
 from app.utils import parse_function_invocation, parse_git_patch
+from app.api.agent_proxy import is_valid_response
 
 # FIXME: the system prompt should be different for stratified/state machine.
 SYSTEM_PROMPT = """You are a software developer maintaining a large project.
@@ -101,6 +102,23 @@ def add_step_trigger(orig_prompt: str, is_first: bool = False) -> str:
     return orig_prompt + "\n" + trigger
 
 
+def parse_search_actions(res_text_list):
+    result_list = []
+    pattern = r'Search Action \d+: (search_\w+\([^)]+\))'
+    for res_text in res_text_list:
+        # TODO add bug locations parsing here
+        api_json = {'API_calls':[], 'bug_locations': []}
+        matches = re.findall(pattern, res_text)
+        for m in matches:
+            api_json['API_calls'].append(m)
+        is_valid, validness_summary = is_valid_response(api_json)
+        if is_valid:
+            result_list.append((json.dumps(api_json),res_text)) 
+        else:
+            result_list.append((None,res_text)) 
+    return result_list
+            
+
 def proxy_apis_helper(api_manager, res_text):
     selected_apis, _, proxy_threads = api_manager.proxy_apis(res_text)
     return selected_apis, res_text     
@@ -171,7 +189,7 @@ Bug Location Correctness 2: [Insert only 'correct' or 'incorrect' here.]
 """
     relevant_thread = critic_msg_thread + [
         {"role": 'user', 'content':selected_critic_info['critic_prompt']},
-        {"role": 'assistant', 'content':selected_critic_info['critic_response']}
+        {"role": 'assistant', 'content':selected_critic_info['critic_response']},
         {"role": 'user', 'content':critic_prompt}
     ]
     res_text, cost, input_tokens, output_tokens = common.CRITIC_MODEL.call(relevant_thread)
@@ -233,6 +251,7 @@ def start_conversation_round_stratified(
     actor_msg_thread: MessageThread,
     critic_msg_thread: MessageThread,
     api_manager: ProjectApiManager,
+    repo_name: str='',
     start_round_no: int = 0,
     print_callback: Callable[[dict], None] | None = None,
 ) -> bool:
@@ -243,6 +262,8 @@ def start_conversation_round_stratified(
     # ZZ: TODO specify the return format in here so that we can avoid the unnecessary api calls 
     prompt = (
         "Based on the files, classes, methods, and code statements from the issue related to the bug, you can use the following search APIs to get more context of the project."
+        "However, note that the search scope is limited to the issue codebase. Do not use the search tools for codebases imported or outside the issue codebase."
+        f"Do not use local file_path the user described in the issue description for search, use the path that start from the issue codebase {repo_name} instead."
         "\n- search_class(class_name: str): Search for a class in the codebase"
         "\n- search_method_in_file(method_name: str, file_path: str): Search for a method in a given file"
         "\n- search_method_in_class(method_name: str, class_name: str): Search for a method in a given class"
@@ -250,7 +271,12 @@ def start_conversation_round_stratified(
         "\n- search_code(code_str: str): Search for a code snippet in the entire codebase"
         "\n- search_code_in_file(code_str: str, file_path: str): Search for a code snippet in a given file file"
         "\n\nNote that you can use multiple search APIs in one round."
-        "\n\nNow analyze the issue and select necessary APIs to get more context of the project. Each API call must have concrete arguments as inputs."
+        "\nNow analyze the issue and select necessary APIs to get more context of the project. Each API call must have concrete arguments as inputs."
+        "\n\nFollowing is the desired response format:"
+        "\nIssue Analysis: [Provide a brief analysis on the issue, with a focus on what further contexts would we need to collect to locate the bug location and explain the underlying problem.]"
+        "\nSearch Action 1: [Insert the first search call here with concrete arguments. Do not use any path from user directory, use path starts from the issue codebase instead]"
+        "\nSearch Action 2: [Insert the second search call here with concrete arguments. ]"
+        "\n..."
     )
     actor_msg_thread.add_user(prompt)
 
@@ -280,14 +306,11 @@ def start_conversation_round_stratified(
         common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
         common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
         
-        # ZZ: proxy api extract the search action in json format. We make a parallel call here for all the different res_texts generated 
-        with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
-            futures = list(executor.map(lambda res_text: proxy_apis_helper(api_manager, res_text), res_text_list))
-            # ZZ: TODO Modify the search action call and therefore get rid of this proxy apis call. This is indirect and unnecessary !
-        
+        # ZZ: replace the proxy api call with simple parsing to extract search calls and potential bug locations  
+        parsed_results = parse_search_actions(res_text_list)
         # ZZ: Categorize each search attempt into correct and incorrect calls 
         correct_tool_calls, incorrect_tool_calls = [], [] 
-        for parsed_apis, res_text in futures:
+        for parsed_apis, res_text in parsed_results:
             if parsed_apis is None:
                 incorrect_tool_calls.append({
                     "actor_response": res_text,
@@ -424,6 +447,7 @@ Is Bug Location 2: [Insert `true` or `false` here ONLY]
         actor_msg_thread.add_rejection_sampled_messages(search_analysis_info_list)
 
         if round_no < globals.conv_round_limit:
+            # ZZ: TODO make this format aligning with the first round prompt and then add buggy location logic 
             msg = (
                 "Based on your analysis, answer below questions:"
                 "\n- do we need more context: construct search API calls to get more context of the project. (leave it empty if you don't need more context)"
@@ -601,7 +625,7 @@ def start_conversation_round_state_machine(
     return True
 
 
-def get_patch_explanation(fix_patch:str, api_manager: ProjectApiManager) -> dict:    
+def get_patch_explanation(repo_name:str, problem_statement:str, fix_patch:str, api_manager: ProjectApiManager) -> tuple[str, str]:    
     patch_info_list = parse_git_patch(fix_patch)
     relevant_context = ""
     for patch_info in patch_info_list:
@@ -649,7 +673,7 @@ def run_one_task(
     """
     # ZZ: Get explanation for critic model first 
     print_banner("Collecting explanations for the issue")
-    exp_prompt, explanation_result = get_patch_explanation(fix_patch, api_manager)
+    exp_prompt, explanation_result = get_patch_explanation(repo_name, problem_stmt, fix_patch, api_manager)
     critic_msg_thread = MessageThread()
     critic_msg_thread.add_user(exp_prompt)
     critic_msg_thread.add_model(explanation_result, tools=[])
@@ -677,7 +701,7 @@ def run_one_task(
 
     if globals.enable_layered:
         return start_conversation_round_stratified(
-            output_dir, actor_msg_thread, critic_msg_thread, api_manager, print_callback=print_callback
+            output_dir, actor_msg_thread, critic_msg_thread, api_manager, repo_name=repo_name, print_callback=print_callback
         )
     else:
         # ZZ: let's ignore this branch since it necessitate more rounds of interactions and more tokens ... 
