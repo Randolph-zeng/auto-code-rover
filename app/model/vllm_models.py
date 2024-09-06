@@ -180,9 +180,9 @@ class OpenaiModel(Model):
 class Llama3_70B_vllm(OpenaiModel):
     def __init__(self):
         super().__init__(
-            "Llama-3.1-70B-Instruct", 0., 0., parallel_tool_call=True
+            "meta/llama-3.1-70b-instruct", 0.0000002, 0.0000008, parallel_tool_call=True
         )
-        self.note = "Meta-Llama-3.1-70B-Instruct served by local vllm server. Cost per input/output assumed to be zero."
+        self.note = "Meta-Llama-3.1-70B-Instruct served by nvidia server. Cost per input/output assumed to be zero."
 
 
 
@@ -197,6 +197,6 @@ class DeepseekCoderV2_16B_vllm(OpenaiModel):
 class DeepseekCoderV2_API(OpenaiModel):
     def __init__(self):
         super().__init__(
-            "deepseek-coder", 0.00000014, 0.00000028, parallel_tool_call=True
+            "deepseek-coder", 0.000001, 0.000002, parallel_tool_call=True
         )
         self.note = "DeepSeek-Coder-API served in openai style."
