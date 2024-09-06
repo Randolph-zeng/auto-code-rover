@@ -212,25 +212,25 @@ def add_task_related_args(parser: ArgumentParser) -> None:
     )
     parser.add_argument(
         "--actor-model-api-key",
-        type=model_parser,
+        type=str,
         default="placeholder",
         help="The api key for the actor model.",
     )
     parser.add_argument(
         "--critic-model-api-key",
-        type=model_parser,
+        type=str,
         default="sk-xxxxx",
         help="The api key for the critic model.",
     )
     parser.add_argument(
         "--actor-model-base-url",
-        type=model_parser,
+        type=str,
         default="",
         help="The base url for the actor model.",
     )
     parser.add_argument(
         "--critic-model-base-url",
-        type=model_parser,
+        type=str,
         default="",
         help="The base url for the critic model.",
     )
