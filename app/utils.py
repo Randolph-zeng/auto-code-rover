@@ -335,6 +335,7 @@ def parse_function_invocation(
     invocation_str: str,
 ) -> tuple[str, list[str]]:
     try:
+        # Parse the function invocation string into an AST
         tree = ast.parse(invocation_str)
         expr = tree.body[0]
         assert isinstance(expr, ast.Expr)
@@ -342,12 +343,26 @@ def parse_function_invocation(
         assert isinstance(call, ast.Call)
         func = call.func
         assert isinstance(func, ast.Name)
+
+        # Extract the function name
         function_name = func.id
-        raw_arguments = [ast.unparse(arg) for arg in call.args]
-        # clean up spaces or quotes, just in case
-        arguments = [arg.strip().strip("'").strip('"') for arg in raw_arguments]
+
+        # Extract all arguments (both positional and keyword) in order
+        arguments = []
+
+        # Add positional arguments in order
+        for arg in call.args:
+            arg_value = ast.unparse(arg).strip().strip("'").strip('"')
+            arguments.append(arg_value)
+
+        # Add keyword arguments in the order they appear
+        for kw in call.keywords:
+            assert isinstance(kw, ast.keyword)
+            value = ast.unparse(kw.value).strip().strip("'").strip('"')
+            arguments.append(value)
 
         try:
+            raw_arguments = [ast.unparse(arg) for arg in call.args] + [ast.unparse(kw.value) for kw in call.keywords]
             new_arguments = [ast.literal_eval(x) for x in raw_arguments]
             if new_arguments != arguments:
                 log_and_print(
@@ -363,3 +378,4 @@ def parse_function_invocation(
         raise ValueError(f"Invalid function invocation: {invocation_str}") from e
 
     return function_name, arguments
+

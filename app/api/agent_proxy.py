@@ -96,7 +96,7 @@ def is_valid_response(data: Any) -> tuple[bool, str]:
             return False, "Both API_calls and bug_locations are empty"
 
         for loc in bug_locations:
-            if loc.get("class") or loc.get("method"):
+            if loc.get("class_name") or loc.get("method_name"):
                 continue
             return False, "Bug location not detailed enough"
     else:
