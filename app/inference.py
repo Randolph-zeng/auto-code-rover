@@ -2,6 +2,7 @@ import inspect
 import json
 import re
 from collections.abc import Callable
+from collections import defaultdict
 from os.path import join as pjoin
 from pathlib import Path
 
@@ -113,11 +114,12 @@ def parse_search_actions_and_bug_locations(res_text_list):
         for m in search_matches:
             api_json['API_calls'].append(m)
         bug_locations_with_indices = re.findall(location_pattern, res_text)
-        location_mapper = {}
+        location_mapper = defaultdict(dict)
         item_type_mapper = {"File Path": "file_name", "Class Name": "class_name", "Reasoning": 'reasoning',
                             "Method Name": "method_name", "Variable Name": "variable_name"}
         for index, item_type, value in bug_locations_with_indices:
-            location_mapper[index][item_type_mapper[item_type]] = value
+            if value:
+                location_mapper[index][item_type_mapper[item_type]] = value
         for bug_loc_index, bug_loc_info in location_mapper.items():
             api_json['bug_locations'].append(bug_loc_info)
         is_valid, validness_summary = is_valid_response(api_json)
@@ -184,10 +186,14 @@ def parse_search_action_critic_feedbacks(correct_call_info_list):
     return 
         
 
-def search_analysis_critic_helper(actor_res, selected_critic_info, critic_msg_thread):
+def search_analysis_critic_helper(actor_res, collated_tool_response, critic_msg_thread):
     critic_prompt = f"""Given the information above, can you help me to determine if the following search analysis on the search results make sense or not?  
 Specifically, for each search result there will be a corresponding analysis on its functionality and if it is the bug location.
 Your job is to (1) decide if the analysis on the functionality within the code execution chain is reasonable or not and (2) decide if the determination of bug location is correct or not.
+
+### Search results
+{collated_tool_response}
+
 
 ### Search Analysis 
 {actor_res}
@@ -203,11 +209,7 @@ Bug Location Correctness 2: [Insert only 'correct' or 'incorrect' here.]
 ...
 """
     # TODO FIXME improve the thread composition below. Currently it seems redundant.
-    relevant_thread = critic_msg_thread + [
-        {"role": 'user', 'content':selected_critic_info['critic_prompt']},
-        {"role": 'assistant', 'content':selected_critic_info['critic_response']},
-        {"role": 'user', 'content':critic_prompt}
-    ]
+    relevant_thread = critic_msg_thread + [{"role": 'user', 'content':critic_prompt}]
     res_text, cost, input_tokens, output_tokens = common.CRITIC_MODEL.call(relevant_thread)
     analysis_info = {
         "actor_response": actor_res,
@@ -220,9 +222,9 @@ Bug Location Correctness 2: [Insert only 'correct' or 'incorrect' here.]
 def parse_search_analysis_critic_feedbacks(analysis_info_list):
     for analysis_info in analysis_info_list:
         pattern = r'Functionality Correctness \d+: (\w+)\nBug Location Correctness \d+: (\w+)'
-        matches = re.findall(pattern, analysis_info["actor_response"])
-        acc_score, action_count = 0
-        for i, (functionality, bug_location) in enumerate(matches, start=1):
+        matches = re.findall(pattern, analysis_info["critic_response"])
+        acc_score, action_count = 0, 0
+        for functionality, bug_location in matches:
             # ZZ: TODO be careful about the rewards given to functionality analysis and bug location analysis 
             # ZZ: if any of the bug location is incorrect ... should we simply disregard this analysis ???
             action_count += 1
@@ -241,15 +243,12 @@ def parse_search_analysis_critic_feedbacks(analysis_info_list):
 
     
 def buggy_loc_critic_helper(buggy_loc_info, critic_msg_thread):
-    # ZZ: TODO Edit the buggy location classification logic 
+    # ZZ: the actor response contains location and location related reasoning, we should not need any collated search results 
     critic_prompt= f"""
 Given the information above, please evaluate the following bug locations and their analyses to determine if they are correct and reasonable for generating a final patch to fix the issue.
 
 # Bug Locations and Analyses
 {buggy_loc_info['actor_response']}
-
-# Retrieved Bug Location Contexts
-{buggy_loc_info['collated_tool_response']}
 
 Please provide your assessment in the format below:
 
@@ -272,11 +271,10 @@ Bug Explanation 2 - Correctness: [Insert only 'correct' or 'incorrect' here]
 
 def parse_buggy_location_critic_feedbacks(buggy_loc_info_list):
     for buggy_loc_info in buggy_loc_info_list:
-        location_correctness_pattern = r"Bug Location (\d+) - Correctness:\s*(correct|incorrect)"
-        explanation_correctness_pattern = r"Bug Explanation (\d+) - Correctness:\s*(correct|incorrect)"
+        location_correctness_pattern = r"\**Correctness of Bug Location \d+\**:\s*\**(correct|incorrect)\**"
+        explanation_correctness_pattern = r"\**Correctness of Bug Explanation \d+\**:\s*\**(correct|incorrect)\**"
         loc_matches = re.findall(location_correctness_pattern, buggy_loc_info["critic_response"])
         exp_matches = re.findall(explanation_correctness_pattern, buggy_loc_info["critic_response"])
-        # ZZ: TODO FIXME do we need all the bug location and bug analysis to be correct before generating the patches ??
         acc_score, loc_num = 0, 0 
         for loc_mat, exp_mat in zip(loc_matches, exp_matches):
             loc_num += 1
@@ -426,8 +424,8 @@ def start_conversation_round_stratified(
                     "collated_tool_response": collated_tool_response,
                 })
             else:
-                # if no search action needed, we should examine the buggy locations 
-                # provide the buggy locations to the model
+                # ZZ: We only perform bug location examanations when no search actions are needed!
+                # if no search action needed, we should examine the buggy locations and provide the buggy locations to the model
                 for bug_location in curr_buggy_locations:
                     tool_output, *_ = search_for_bug_location(
                         api_manager, actor_msg_thread, bug_location
@@ -524,7 +522,7 @@ Is Bug Location 2: [Insert `true` or `false` here ONLY]
         # TODO: Do we really need to analyse the bug locations ? Or do we need k analysis ? 
         with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
             futures = list(executor.map(lambda res_text: search_analysis_critic_helper(res_text, 
-                sorted_correct_tool_calls[0], critic_msg_thread.to_msg()), res_text_list))
+                sorted_correct_tool_calls[0]["collated_tool_response"], critic_msg_thread.to_msg()), res_text_list))
         common.thread_cost.process_cost += sum([f[1] for f in futures])
         common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
         common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
@@ -535,13 +533,13 @@ Is Bug Location 2: [Insert `true` or `false` here ONLY]
         sorted_search_analysis_list = sorted(search_analysis_info_list, key=lambda x: x['reward'], reverse=True) 
         sorted_search_analysis_list[0]['selected'] = True
         actor_msg_thread.add_model(sorted_search_analysis_list[0]['actor_response'], tools=[])        
-        print_retrieval(res_text, f"round {round_no}", print_callback=print_callback)
+        print_retrieval(sorted_search_analysis_list[0]['actor_response'], f"round {round_no}", print_callback=print_callback)
 
         # ZZ: save the rejection sampling actor results and critic feedbacks
         actor_msg_thread.add_rejection_sampled_messages(search_analysis_info_list)
 
         if round_no < globals.conv_round_limit:
-            # ZZ: TODO make this format aligning with the first round prompt and then add buggy location logic 
+            # ZZ: TODO Do we want to make the LLM only output either the search actions or bug locations but not both ?  
             msg = (
                 "Based on your analysis, please address the following:"
                 "\n1. Do we need more context? If yes, generate search API calls to gather additional project context. Leave this blank if no further context is needed."
