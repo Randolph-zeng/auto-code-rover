@@ -8,6 +8,7 @@ from pathlib import Path
 
 from loguru import logger
 from termcolor import colored
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from app import globals
 from app.api.manage import ProjectApiManager
@@ -24,6 +25,9 @@ from app.model import common, ollama
 from app.search.search_manage import SearchManager
 from app.utils import parse_function_invocation, parse_git_patch
 from app.api.agent_proxy import is_valid_response
+from app.post_process import extract_diff_one_instance, ExtractStatus
+
+
 
 # FIXME: the system prompt should be different for stratified/state machine.
 SYSTEM_PROMPT = """You are a software developer maintaining a large project.
@@ -378,6 +382,98 @@ def get_search_or_bug_location_prompt(round_no, repo_name):
     return prompt
 
 
+def generate_patch_parallel(actor_msg_thread, output_dir, print_callback):
+    patch_system_prompt = """You are a software developer maintaining a large project.
+You are working on an issue submitted to your project.
+The issue contains a description marked between <issue> and </issue>.
+You ultimate goal is to write a patch that resolves this issue.
+"""
+    patch_gen_prompt = """Write a patch for the issue, based on the retrieved context.\n\nYou can import necessary libraries.\n\n
+Return the patch in the format below.\n\nWithin `<file></file>`, replace `...` with actual file path.\n\nWithin `<original></original>`, replace `...` with the original code snippet from the program.\n\nWithin `<patched></patched>`, replace `...` with the fixed version of the original code. When adding orignal code and updated code, pay attention to indentation, as the code is in Python.
+You can write multiple modifications if needed.
+
+```
+# modification 1
+<file>...</file>
+<original>...</original>
+<patched>...</patched>
+
+# modification 2
+<file>...</file>
+<original>...</original>
+<patched>...</patched>
+
+# modification 3
+...
+```
+Please make sure your patch is wrapped in ``` as indicated above.
+"""
+    messages = deepcopy(actor_msg_thread.messages)
+    patch_thread: MessageThread = MessageThread(messages=messages)
+    if patch_thread.messages[0]['role'] == 'system': 
+        patch_thread.messages[0]["content"] = patch_system_prompt
+    patch_thread.add_user(patch_gen_prompt) 
+    # We do not count the api request num for budget limit here because we enforce ground truth solution without actually running the validation test
+    # therefore it is unnecessary to filter the patch generation, thus no budget control needed  
+    with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
+        futures = list(executor.map(lambda x: actor_model_helper(patch_thread.to_msg()), range(globals.rejection_sampling_k)))
+    res_text_list = [f[0] for f in futures]
+    common.thread_cost.process_cost += sum([f[1] for f in futures])
+    common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
+    common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+    # This step will modify the repo and have to be executed sequentially 
+    applicable_patch_list, inapplicable_patch_list = [], []
+    for i, patch in enumerate(res_text_list):
+        raw_patch_file = pjoin(output_dir, f"agent_patch_raw_{i}")
+        diff_file = pjoin(output_dir, f"extracted_patch_{i}.diff")
+        with open(raw_patch_file, "w") as f:
+            f.write(patch)
+        extract_status, extract_msg = extract_diff_one_instance(raw_patch_file, diff_file)
+        if extract_status == ExtractStatus.APPLICABLE_PATCH:
+            applicable_patch_list.append(patch)
+        else:
+            inapplicable_patch_list.append(patch)
+    print_acr(f"For {globals.rejection_sampling_k} patches generated, {len(applicable_patch_list)} are applicable patches.",
+        f"solution patch generation", print_callback=print_callback)
+    return applicable_patch_list, inapplicable_patch_list
+
+
+def add_patch_info(actor_msg_thread, fix_patch, applicable_patch_list, inapplicable_patch_list):
+    patch_info_list = []
+    # ground truth patch
+    patch_info_list.append({
+        "actor_response": fix_patch,
+        "collated_tool_response": "",
+        'critic_prompt': '',
+        "critic_response": '',
+        "reward": 1, 
+        'selected': True,
+        'action_type': 'PATCH_GENERATION'
+    })
+    # applicable and inapplicable patches
+    for patch in applicable_patch_list:
+        patch_info_list.append({
+            "actor_response": patch,
+            "collated_tool_response": "",
+            'critic_prompt': '',
+            "critic_response": '',
+            "reward": 0.3, 
+            'selected': False,
+            'action_type': 'PATCH_GENERATION'
+        })
+    for patch in inapplicable_patch_list:
+        patch_info_list.append({
+            "actor_response": patch,
+            "collated_tool_response": "",
+            'critic_prompt': '',
+            "critic_response": '',
+            "reward": -1, 
+            'selected': False,
+            'action_type': 'PATCH_GENERATION'
+        })
+    actor_msg_thread.add_rejection_sampled_messages(patch_info_list)
+    
+
 def start_conversation_round_stratified(
     output_dir: str,
     actor_msg_thread: MessageThread,
@@ -385,11 +481,13 @@ def start_conversation_round_stratified(
     api_manager: ProjectApiManager,
     repo_name: str='',
     print_callback: Callable[[dict], None] | None = None,
+    fix_patch= str=''
 ) -> bool:
     """
     This version uses formatted response instead of using the OpenAI function calling.
     Advantage is that multiple API calls can be made in a single round.
     """
+    api_request_count = 0
     # TODO: FIXME setup budget control here. once met break anyway
     for round_no in range(globals.conv_round_limit):
         api_manager.start_new_tool_call_layer()
@@ -416,6 +514,8 @@ def start_conversation_round_stratified(
             common.thread_cost.process_cost += sum([f[1] for f in futures])
             common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
             common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+            api_request_count += globals.rejection_sampling_k
+            if api_request_count >= globals.total_request_num: break
             
             # ZZ: replace the proxy api call with simple parsing to extract search calls and potential bug locations  
             parsed_results = parse_search_actions_and_bug_locations(res_text_list)
@@ -499,6 +599,8 @@ def start_conversation_round_stratified(
                 common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
                 common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
                 parse_search_action_critic_feedbacks(correct_tool_calls)
+                api_request_count += len(correct_tool_calls)
+                
             if correct_buggy_locations:
                 with ThreadPoolExecutor(max_workers=len(correct_buggy_locations)) as executor:
                     futures = list(executor.map(lambda buggy_loc_info: buggy_loc_critic_helper(buggy_loc_info, critic_msg_thread.to_msg()), correct_buggy_locations))
@@ -506,11 +608,14 @@ def start_conversation_round_stratified(
                 common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
                 common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
                 parse_buggy_location_critic_feedbacks(correct_buggy_locations)
+                api_request_count += len(correct_buggy_locations)
+
             sorted_correct_tool_calls = sorted(correct_tool_calls+correct_buggy_locations, key=lambda x: x['reward'], reverse=True) 
             # ZZ: save the rejection sampling actor results and critic feedbacks
             combined_info_list.extend(correct_tool_calls + incorrect_tool_calls + correct_buggy_locations + incorrect_buggy_locations)
             # make sure 1. the search actions have at least one relevant 2. the bug location and reasoning are correct
             search_action_condition_met = sorted_correct_tool_calls[0]['condition_met']
+            if api_request_count >= globals.total_request_num: break
             
         sorted_correct_tool_calls[0]['selected'] = True
         actor_msg_thread.add_model(sorted_correct_tool_calls[0]['actor_response'], tools=[])
@@ -521,26 +626,24 @@ def start_conversation_round_stratified(
         selected_apis_json = json.loads(sorted_correct_tool_calls[0]['parsed_apis'])
         json_api_calls, buggy_locations = print_selected_search_action_results(selected_apis_json, 
             sorted_correct_tool_calls[0]['collated_tool_response'], round_no, print_callback)
-        # TODO FIXME run parallel generation here and then sequentially apply the changes, then save the whole trajectory and finish the whole pipeline here .
+        
+        if api_request_count >= globals.total_request_num:
+            print_acr(f"Finish the trajectory collection due to api request number exceeds the budget {globals.total_request_num} ...", "Trajectory Collection Finished", print_callback=print_callback) 
+            break
+
+        # run parallel generation here and then sequentially apply the changes, then save the whole trajectory and finish the whole pipeline here .
         if sorted_correct_tool_calls[0]['action_type'] == "BUG_LOCATION":
             # If the selected action is bug locations, it should 
             print_banner("PATCH GENERATION")
             logger.debug("Gathered enough information. Invoking write_patch.")
-            print_acr(
-                collated_tool_response,
-                "patch generation round 1",
-                print_callback=print_callback,
-            )
-            # TODO: We need to differentiate situations where contexts collected are enough versus conv rounds limit reached
-            intent = FunctionCallIntent("write_patch", {}, None)
-            api_manager.start_new_tool_call_layer()
-            api_manager.dispatch_intent(intent, actor_msg_thread, print_callback=print_callback)
-            logger.info(f"Invoked {intent.func_name}.")
-
+            
+            applicable_patch_list, inapplicable_patch_list = generate_patch_parallel(actor_msg_thread, output_dir, print_callback)
             logger.info("Ending workflow.")
-            conversation_file = pjoin(output_dir, f"conversation_round_{round_no}.json")
+            # save all the patches along with the ground truth into the actor thread 
+            add_patch_info(actor_msg_thread, fix_patch, applicable_patch_list, inapplicable_patch_list)
+            conversation_file = pjoin(output_dir, f"final_trajectory.json")
             actor_msg_thread.save_to_file(conversation_file)
-            break # TODO
+            break 
          
         msg = """Let's analyze collected context in the following desired format:
 Code Explanation 1: [For the first search result, briefly explain the functionalities/logic of the code snippet returned.]
@@ -566,6 +669,8 @@ Is Bug Location 2: [Insert `true` or `false` here ONLY]
             common.thread_cost.process_cost += sum([f[1] for f in futures])
             common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
             common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+            api_request_count += globals.rejection_sampling_k
+            if api_request_count >= globals.total_request_num: break
 
             with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
                 futures = list(executor.map(lambda res_text: search_analysis_critic_helper(res_text, 
@@ -573,11 +678,14 @@ Is Bug Location 2: [Insert `true` or `false` here ONLY]
             common.thread_cost.process_cost += sum([f[1] for f in futures])
             common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
             common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+            api_request_count += globals.rejection_sampling_k
+
             search_analysis_list = [f[0] for f in futures]
             parse_search_analysis_critic_feedbacks(search_analysis_list)
             search_analysis_info_list.extend(search_analysis_list)
             sorted_search_analysis_list = sorted(search_analysis_info_list, key=lambda x: x['reward'], reverse=True) 
             search_analysis_condition_met = sorted_search_analysis_list[0]['condition_met']
+            if api_request_count >= globals.total_request_num: break
             
         # ZZ: select the best search analysis 
         sorted_search_analysis_list[0]['selected'] = True
@@ -585,6 +693,9 @@ Is Bug Location 2: [Insert `true` or `false` here ONLY]
         print_retrieval(sorted_search_analysis_list[0]['actor_response'], f"round {round_no}", print_callback=print_callback)
         # ZZ: save the rejection sampling actor results and critic feedbacks
         actor_msg_thread.add_rejection_sampled_messages(search_analysis_info_list)
+        if api_request_count >= globals.total_request_num: 
+            print_acr(f"Finish the trajectory collection due to api request number exceeds the budget {globals.total_request_num} ...", "Trajectory Collection Finished", print_callback=print_callback) 
+            break
 
     return True
 
@@ -815,7 +926,7 @@ def run_one_task(
 
     if globals.enable_layered:
         return start_conversation_round_stratified(
-            output_dir, actor_msg_thread, critic_msg_thread, api_manager, repo_name=repo_name, print_callback=print_callback
+            output_dir, actor_msg_thread, critic_msg_thread, api_manager, repo_name=repo_name, print_callback=print_callback, fix_patch=fix_patch
         )
     else:
         # ZZ: let's ignore this branch since it necessitate more rounds of interactions and more tokens ... 
