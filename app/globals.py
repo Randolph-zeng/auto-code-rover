@@ -38,3 +38,7 @@ context_generation_limit: int = -1
 
 # ZZ: The number of possible outcomes to sample at each step for rejection sampling.
 rejection_sampling_k: int = -1
+
+# ZZ: The budget control parameters for rejection sampling rounds and overall api request numbers
+rejection_sampling_rounds: int = 3
+total_request_num: int = 100

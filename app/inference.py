@@ -106,9 +106,9 @@ def add_step_trigger(orig_prompt: str, is_first: bool = False) -> str:
 def parse_search_actions_and_bug_locations(res_text_list):
     result_list = []
     search_pattern = r'Search Action \d+:\s*(?:`|```(?:python)?)?\s*(search_\w+\((?:[^()]*|\([^()]*\)|".*?"|\'.*?\')*?\))\s*(?:`|```)?'
+    # TODO FIXME fix this format 
     location_pattern = r"Bug Location (\d+) - (Reasoning|File Path|Class Name|Function Name|Variable Name):\s*(.*)"
     for res_text in res_text_list:
-        # TODO add bug locations parsing here
         api_json = {'API_calls':[], 'bug_locations': []}
         search_matches = re.findall(search_pattern, res_text)
         for m in search_matches:
@@ -128,7 +128,7 @@ def parse_search_actions_and_bug_locations(res_text_list):
         else:
             result_list.append((None,res_text)) 
     return result_list
-            
+
 
 def proxy_apis_helper(api_manager, res_text):
     selected_apis, _, proxy_threads = api_manager.proxy_apis(res_text)
@@ -170,19 +170,22 @@ Category: [Insert only 'Relevant', 'Neutral', 'Unrelated' or 'Imprecise' here.]
 def parse_search_action_critic_feedbacks(correct_call_info_list):
     for correct_call_info in correct_call_info_list:
         categories = re.findall(r'Category: (\w+)', correct_call_info["critic_response"])
-        # ZZ: TODO How do we assign scores to the actions. Average or Best? What is the score for each category?
         category_mapper = {
             'relevant': 1, 'neutral': 0.5, 'unrelated': 0, 'imprecise': -0.2
         }
         acc_score, success_cat_num = 0, 0 
+        condition_met = False
         for cat in categories:
             if cat.lower() in category_mapper: 
                 acc_score += category_mapper[cat.lower()]  
                 success_cat_num += 1
+            if cat.lower() == 'relevant':
+                condition_met = True # ZZ: for every search action we require at least one search that is relevant 
         avg_score = acc_score/success_cat_num if success_cat_num else 0
         correct_call_info["reward"] = avg_score
         correct_call_info["selected"] = False
         correct_call_info['action_type'] = "SEARCH_CONTEXT"
+        correct_call_info['condition_met'] = condition_met
     return 
         
 
@@ -208,7 +211,6 @@ Functionality Correctness 2: [Insert only 'correct' or 'incorrect' here.]
 Bug Location Correctness 2: [Insert only 'correct' or 'incorrect' here.]
 ...
 """
-    # TODO FIXME improve the thread composition below. Currently it seems redundant.
     relevant_thread = critic_msg_thread + [{"role": 'user', 'content':critic_prompt}]
     res_text, cost, input_tokens, output_tokens = common.CRITIC_MODEL.call(relevant_thread)
     analysis_info = {
@@ -224,26 +226,30 @@ def parse_search_analysis_critic_feedbacks(analysis_info_list):
         pattern = r'Functionality Correctness \d+: (\w+)\nBug Location Correctness \d+: (\w+)'
         matches = re.findall(pattern, analysis_info["critic_response"])
         acc_score, action_count = 0, 0
+        condition_met = True # all the analysis need to be correct  
         for functionality, bug_location in matches:
-            # ZZ: TODO be careful about the rewards given to functionality analysis and bug location analysis 
-            # ZZ: if any of the bug location is incorrect ... should we simply disregard this analysis ???
+            # ZZ: TODO be careful about the rewards given to functionality analysis and bug location analysis
             action_count += 1
             if functionality.strip().lower() == 'correct': 
                 acc_score += 0.5
             else:
                 acc_score -= 1
+                condition_met = False
             if bug_location.strip().lower() == 'correct': 
                 acc_score += 1
             else:
-                acc_score -= 2 
+                acc_score -= 2
+                condition_met = False
         reward = acc_score/action_count if action_count != 0 else 0
         analysis_info["reward"] = reward
         analysis_info["selected"] = False
         analysis_info["action_type"] = "SEARCH_ANALYSIS"
+        analysis_info["condition_met"] = condition_met
 
     
 def buggy_loc_critic_helper(buggy_loc_info, critic_msg_thread):
     # ZZ: the actor response contains location and location related reasoning, we should not need any collated search results 
+    # TODO FIXME Add a logic that extracts all the modified locations and ask the critic model to check if all are found. 
     critic_prompt= f"""
 Given the information above, please evaluate the following bug locations and their analyses to determine if they are correct and reasonable for generating a final patch to fix the issue.
 
@@ -276,6 +282,7 @@ def parse_buggy_location_critic_feedbacks(buggy_loc_info_list):
         loc_matches = re.findall(location_correctness_pattern, buggy_loc_info["critic_response"])
         exp_matches = re.findall(explanation_correctness_pattern, buggy_loc_info["critic_response"])
         acc_score, loc_num = 0, 0 
+        condition_met = True # for every location proposed, both the location and explanation need to be correct 
         for loc_mat, exp_mat in zip(loc_matches, exp_matches):
             loc_num += 1
             if loc_mat[1].lower() == 'correct':
@@ -283,12 +290,15 @@ def parse_buggy_location_critic_feedbacks(buggy_loc_info_list):
                     acc_score += 1
                 else:
                     acc_score += 0.5
+                    condition_met = False
             else:
                 acc_score -= 0.5
+                condition_met = False
         avg_score = acc_score/loc_num if loc_num else 0
         buggy_loc_info["reward"] = avg_score
         buggy_loc_info["selected"] = False
         buggy_loc_info['action_type'] = "BUG_LOCATION"
+        buggy_loc_info['condition_met'] = condition_met
     return 
 
 
@@ -316,7 +326,57 @@ def print_selected_search_action_results(selected_apis_json, collated_tool_respo
         print_callback=print_callback,
     )
     return json_api_calls, buggy_locations
-    
+
+
+def get_search_or_bug_location_prompt(round_no, repo_name):
+    if round_no == 0:
+        # ZZ: specify the return format in here so that we can avoid the unnecessary api calls 
+        prompt = (
+            "Based on the files, classes, methods, and code statements from the issue related to the bug, you can use the following search APIs to get more context of the project."
+            "However, note that the search scope is limited to the issue codebase. Do not use the search tools for codebases imported or outside the issue codebase."
+            f"Do not use local file_path the user described in the issue description for search, use the path that start from the issue codebase {repo_name} instead."
+            "\n- search_class(class_name: str): Search for a class in the codebase"
+            "\n- search_method_in_file(method_name: str, file_path: str): Search for a method in a given file"
+            "\n- search_method_in_class(method_name: str, class_name: str): Search for a method in a given class"
+            "\n- search_method(method_name: str): Search for a method in the entire codebase"
+            "\n- search_code(code_str: str): Search for a code snippet in the entire codebase"
+            "\n- search_code_in_file(code_str: str, file_path: str): Search for a code snippet in a given file file"
+            "\n\nNote that you can use multiple search APIs in one round."
+            "\nNow analyze the issue and select necessary APIs to get more context of the project. Each API call must have concrete arguments as inputs."
+            "\n\nFollowing is the desired response format:"
+            "\nIssue Analysis: [Provide a brief analysis on the issue, with a focus on what further contexts would we need to collect to locate the bug location and explain the underlying problem.]"
+            "\nSearch Action 1: [Insert the first search call here with concrete arguments. Do not use any path from user directory, use path starts from the issue codebase instead]"
+            "\nSearch Action 2: [Insert the second search call here with concrete arguments. ]"
+            "\n..."
+        )
+    else:
+        # ZZ: TODO Do we want to make the LLM only output either the search actions or bug locations but not both ?  
+        prompt = (
+            "Based on your analysis, please address the following:"
+            "\n1. Do we need more context? If yes, generate search API calls to gather additional project context. Leave this blank if no further context is needed."
+            "\n2. Where are the bug locations? Provide the details in the specified format below. Leave this section blank if insufficient information is available."
+            "\n\nResponse Format:"
+            "\nIssue Analysis: [Briefly summarize the current progress, focusing on whether more context is needed or if the bug location can already be determined.]"
+            "\nSearch Action 1: [Include the first search call with specific arguments. Omit if sufficient context has been gathered for fault localization.]"
+            "\nSearch Action 2: [Include the second search call with specific arguments. Omit if sufficient context has been gathered for fault localization.]"
+            "\n..."
+            "\nBug Location Analysis: [If enough context is gathered, identify potential locations that require modifications. For each location, explain why the code causes the issue and what modifications are needed. Leave the analysis and following location blocks **BLANK** if unknown.]"
+            "\nBug Location 1: "
+            "\n    File Path: [Full path to the file where the bug is located. Required.]"
+            "\n    Class Name: [Name of the class where the bug is located. Omit if not applicable.]"
+            "\n    Function Name: [Name of the function where the bug is located. Omit if not applicable.]"
+            "\n    Variable Name: [Name of the variable involved in the bug. Omit if not applicable.]"
+            "\n    Reason: [Explain why the code causes the issue and what modifications are needed.]"
+            "\nBug Location 2: "
+            "\n    File Path: [Full path to the file where the bug is located. Required.]"
+            "\n    Class Name: [Name of the class where the bug is located. Omit if not applicable.]"
+            "\n    Function Name: [Name of the function where the bug is located. Omit if not applicable.]"
+            "\n    Variable Name: [Name of the variable involved in the bug. Omit if not applicable.]"
+            "\n    Reason: [Explain why the code causes the issue and what modifications are needed.]"
+            "\n..."
+        )
+    return prompt
+
 
 def start_conversation_round_stratified(
     output_dir: str,
@@ -324,39 +384,14 @@ def start_conversation_round_stratified(
     critic_msg_thread: MessageThread,
     api_manager: ProjectApiManager,
     repo_name: str='',
-    start_round_no: int = 0,
     print_callback: Callable[[dict], None] | None = None,
 ) -> bool:
     """
-    This version uses json data to process API calls, instead of using the OpenAI function calling.
+    This version uses formatted response instead of using the OpenAI function calling.
     Advantage is that multiple API calls can be made in a single round.
     """
-    # ZZ: TODO specify the return format in here so that we can avoid the unnecessary api calls 
-    prompt = (
-        "Based on the files, classes, methods, and code statements from the issue related to the bug, you can use the following search APIs to get more context of the project."
-        "However, note that the search scope is limited to the issue codebase. Do not use the search tools for codebases imported or outside the issue codebase."
-        f"Do not use local file_path the user described in the issue description for search, use the path that start from the issue codebase {repo_name} instead."
-        "\n- search_class(class_name: str): Search for a class in the codebase"
-        "\n- search_method_in_file(method_name: str, file_path: str): Search for a method in a given file"
-        "\n- search_method_in_class(method_name: str, class_name: str): Search for a method in a given class"
-        "\n- search_method(method_name: str): Search for a method in the entire codebase"
-        "\n- search_code(code_str: str): Search for a code snippet in the entire codebase"
-        "\n- search_code_in_file(code_str: str, file_path: str): Search for a code snippet in a given file file"
-        "\n\nNote that you can use multiple search APIs in one round."
-        "\nNow analyze the issue and select necessary APIs to get more context of the project. Each API call must have concrete arguments as inputs."
-        "\n\nFollowing is the desired response format:"
-        "\nIssue Analysis: [Provide a brief analysis on the issue, with a focus on what further contexts would we need to collect to locate the bug location and explain the underlying problem.]"
-        "\nSearch Action 1: [Insert the first search call here with concrete arguments. Do not use any path from user directory, use path starts from the issue codebase instead]"
-        "\nSearch Action 2: [Insert the second search call here with concrete arguments. ]"
-        "\n..."
-    )
-    actor_msg_thread.add_user(prompt)
-
-    round_no = start_round_no
-
-    round_count = range(start_round_no, globals.conv_round_limit + 1)
-
-    for round_no in round_count:
+    # TODO: FIXME setup budget control here. once met break anyway
+    for round_no in range(globals.conv_round_limit):
         api_manager.start_new_tool_call_layer()
 
         conversation_file = pjoin(output_dir, f"conversation_round_{round_no}.json")
@@ -364,127 +399,129 @@ def start_conversation_round_stratified(
         actor_msg_thread.save_to_file(conversation_file)
 
         print_banner(f"CONTEXT RETRIEVAL ROUND {round_no}")
-
+        prompt = get_search_or_bug_location_prompt(round_no, repo_name)
+        actor_msg_thread.add_user(prompt)
         print_acr(
             prompt,
-            f"context retrieval round {start_round_no}",
+            f"context retrieval round {round_no}",
             print_callback=print_callback,
         )
-        # ZZ: perform batch inference here so that we can apply rejection sampling, note res_text is a list and need special handling
-        with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
-            futures = list(executor.map(lambda x: actor_model_helper(actor_msg_thread.to_msg()), range(globals.rejection_sampling_k)))
-        res_text_list = [f[0] for f in futures]
-        common.thread_cost.process_cost += sum([f[1] for f in futures])
-        common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
-        common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
-        
-        # ZZ: replace the proxy api call with simple parsing to extract search calls and potential bug locations  
-        parsed_results = parse_search_actions_and_bug_locations(res_text_list)
-        # ZZ: Categorize each search attempt into correct and incorrect calls 
-        correct_tool_calls, incorrect_tool_calls, = [], []
-        correct_buggy_locations, incorrect_buggy_locations = [], []   
-        for parsed_apis, res_text in parsed_results:
-            apis_json = json.loads(parsed_apis) if parsed_apis is not None else {}
-            curr_json_api_calls = apis_json.get("API_calls", [])
-            curr_buggy_locations = apis_json.get("bug_locations", [])
-            if parsed_apis is None:
-                incorrect_tool_calls.append({
-                    "actor_response": res_text,
-                    'parsed_apis': parsed_apis,
-                    "collated_tool_response": "",
-                    'critic_prompt': '',
-                    "critic_response": DEFAULT_CRITIC_RESPONSE, # ZZ: provide a default critic feedback to failed actions 
-                    "reward": -1,  # ZZ: by default we give -1 to actions not following the desired format ?
-                    'selected': False,
-                    'action_type': 'FAILED'
-                })
-            elif curr_json_api_calls:
-                # ZZ: for search actions successfully parsed, we should collect related contexts, send to critic models to get feedbacks  
-                collated_tool_response = ""
-                for api_call in curr_json_api_calls:
-                    func_name, func_args = parse_function_invocation(api_call)
-
-                    arg_spec = inspect.getfullargspec(getattr(SearchManager, func_name))
-                    arg_names = arg_spec.args[1:]  # first parameter is self
-
-                    assert len(func_args) == len(
-                        arg_names
-                    ), f"Number of argument is wrong in API call: {api_call}"
-
-                    kwargs = dict(zip(arg_names, func_args))
-                    intent = FunctionCallIntent(func_name, kwargs, None)
-                    tool_output, _, _ = api_manager.dispatch_intent(intent, actor_msg_thread)
-
-                    collated_tool_response += f"Result of {api_call}:\n\n"
-                    collated_tool_response += tool_output + "\n\n"
-                # fill in the critic response and reward later
-                correct_tool_calls.append({
-                    "actor_response": res_text,
-                    "parsed_apis": parsed_apis,
-                    "collated_tool_response": collated_tool_response,
-                })
-            else:
-                # ZZ: We only perform bug location examanations when no search actions are needed!
-                # if no search action needed, we should examine the buggy locations and provide the buggy locations to the model
-                for bug_location in curr_buggy_locations:
-                    tool_output, *_ = search_for_bug_location(
-                        api_manager, actor_msg_thread, bug_location
-                    )
-                    collated_tool_response += f"\n\n{tool_output}\n"
-                if (
-                    "Unknown function" not in collated_tool_response
-                    and "Could not" not in collated_tool_response
-                ):
-                    correct_buggy_locations.append({
-                        "actor_response": res_text,
-                        "parsed_apis": parsed_apis,
-                        "collated_tool_response": collated_tool_response
-                    })
-                else:
-                    # TODO FIXME should we worry about the default feedback and reward here ?
-                    incorrect_buggy_locations.append({
+        search_action_condition_met = False
+        combined_info_list = [] # list for the repeated sampling 
+        while not search_action_condition_met:
+            # ZZ: perform batch inference here so that we can apply rejection sampling, note res_text is a list and need special handling
+            with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
+                futures = list(executor.map(lambda x: actor_model_helper(actor_msg_thread.to_msg()), range(globals.rejection_sampling_k)))
+            res_text_list = [f[0] for f in futures]
+            common.thread_cost.process_cost += sum([f[1] for f in futures])
+            common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
+            common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+            
+            # ZZ: replace the proxy api call with simple parsing to extract search calls and potential bug locations  
+            parsed_results = parse_search_actions_and_bug_locations(res_text_list)
+            # ZZ: Categorize each search attempt into correct and incorrect calls 
+            correct_tool_calls, incorrect_tool_calls, = [], []
+            correct_buggy_locations, incorrect_buggy_locations = [], []   
+            for parsed_apis, res_text in parsed_results:
+                apis_json = json.loads(parsed_apis) if parsed_apis is not None else {}
+                curr_json_api_calls = apis_json.get("API_calls", [])
+                curr_buggy_locations = apis_json.get("bug_locations", [])
+                if parsed_apis is None:
+                    incorrect_tool_calls.append({
                         "actor_response": res_text,
                         'parsed_apis': parsed_apis,
-                        "collated_tool_response": collated_tool_response,
+                        "collated_tool_response": "",
                         'critic_prompt': '',
                         "critic_response": DEFAULT_CRITIC_RESPONSE, # ZZ: provide a default critic feedback to failed actions 
                         "reward": -1,  # ZZ: by default we give -1 to actions not following the desired format ?
                         'selected': False,
                         'action_type': 'FAILED'
                     })
-        # ZZ: TODO FIXME The comparsion between rewards given in search and bug actions should be fair!
-        # TODO FIXME we should instead use while loop to guarantee to collect search actions and bug locations 
-        if correct_tool_calls:
-            with ThreadPoolExecutor(max_workers=len(correct_tool_calls)) as executor:
-                futures = list(executor.map(lambda correct_call_info: search_action_critic_helper(correct_call_info, critic_msg_thread.to_msg()), correct_tool_calls))
-            common.thread_cost.process_cost += sum([f[1] for f in futures])
-            common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
-            common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
-            parse_search_action_critic_feedbacks(correct_tool_calls)
-        if correct_buggy_locations:
-            with ThreadPoolExecutor(max_workers=len(correct_buggy_locations)) as executor:
-                futures = list(executor.map(lambda buggy_loc_info: buggy_loc_critic_helper(buggy_loc_info, critic_msg_thread.to_msg()), correct_buggy_locations))
-            common.thread_cost.process_cost += sum([f[1] for f in futures])
-            common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
-            common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
-            parse_buggy_location_critic_feedbacks(correct_buggy_locations)
-        sorted_correct_tool_calls = sorted(correct_tool_calls+correct_buggy_locations, key=lambda x: x['reward'], reverse=True) 
+                elif curr_json_api_calls:
+                    # ZZ: for search actions successfully parsed, we should collect related contexts, send to critic models to get feedbacks  
+                    collated_tool_response = ""
+                    for api_call in curr_json_api_calls:
+                        func_name, func_args = parse_function_invocation(api_call)
+
+                        arg_spec = inspect.getfullargspec(getattr(SearchManager, func_name))
+                        arg_names = arg_spec.args[1:]  # first parameter is self
+
+                        assert len(func_args) == len(
+                            arg_names
+                        ), f"Number of argument is wrong in API call: {api_call}"
+
+                        kwargs = dict(zip(arg_names, func_args))
+                        intent = FunctionCallIntent(func_name, kwargs, None)
+                        tool_output, _, _ = api_manager.dispatch_intent(intent, actor_msg_thread)
+
+                        collated_tool_response += f"Result of {api_call}:\n\n"
+                        collated_tool_response += tool_output + "\n\n"
+                    # fill in the critic response and reward later
+                    correct_tool_calls.append({
+                        "actor_response": res_text,
+                        "parsed_apis": parsed_apis,
+                        "collated_tool_response": collated_tool_response,
+                    })
+                else:
+                    # ZZ: We only perform bug location examanations when no search actions are needed!
+                    # if no search action needed, we should examine the buggy locations and provide the buggy locations to the model
+                    for bug_location in curr_buggy_locations:
+                        tool_output, *_ = search_for_bug_location(
+                            api_manager, actor_msg_thread, bug_location
+                        )
+                        collated_tool_response += f"\n\n{tool_output}\n"
+                    if (
+                        "Unknown function" not in collated_tool_response
+                        and "Could not" not in collated_tool_response
+                    ):
+                        correct_buggy_locations.append({
+                            "actor_response": res_text,
+                            "parsed_apis": parsed_apis,
+                            "collated_tool_response": collated_tool_response
+                        })
+                    else:
+                        # TODO FIXME should we worry about the default feedback and reward here ?
+                        incorrect_buggy_locations.append({
+                            "actor_response": res_text,
+                            'parsed_apis': parsed_apis,
+                            "collated_tool_response": collated_tool_response,
+                            'critic_prompt': '',
+                            "critic_response": DEFAULT_CRITIC_RESPONSE, # ZZ: provide a default critic feedback to failed actions 
+                            "reward": -1,  # ZZ: by default we give -1 to actions not following the desired format ?
+                            'selected': False,
+                            'action_type': 'FAILED'
+                        })
+            # ZZ: TODO FIXME The comparsion between rewards given in search and bug actions should be fair!
+            if correct_tool_calls:
+                with ThreadPoolExecutor(max_workers=len(correct_tool_calls)) as executor:
+                    futures = list(executor.map(lambda correct_call_info: search_action_critic_helper(correct_call_info, critic_msg_thread.to_msg()), correct_tool_calls))
+                common.thread_cost.process_cost += sum([f[1] for f in futures])
+                common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
+                common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+                parse_search_action_critic_feedbacks(correct_tool_calls)
+            if correct_buggy_locations:
+                with ThreadPoolExecutor(max_workers=len(correct_buggy_locations)) as executor:
+                    futures = list(executor.map(lambda buggy_loc_info: buggy_loc_critic_helper(buggy_loc_info, critic_msg_thread.to_msg()), correct_buggy_locations))
+                common.thread_cost.process_cost += sum([f[1] for f in futures])
+                common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
+                common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+                parse_buggy_location_critic_feedbacks(correct_buggy_locations)
+            sorted_correct_tool_calls = sorted(correct_tool_calls+correct_buggy_locations, key=lambda x: x['reward'], reverse=True) 
+            # ZZ: save the rejection sampling actor results and critic feedbacks
+            combined_info_list.extend(correct_tool_calls + incorrect_tool_calls + correct_buggy_locations + incorrect_buggy_locations)
+            # make sure 1. the search actions have at least one relevant 2. the bug location and reasoning are correct
+            search_action_condition_met = sorted_correct_tool_calls[0]['condition_met']
+            
         sorted_correct_tool_calls[0]['selected'] = True
         actor_msg_thread.add_model(sorted_correct_tool_calls[0]['actor_response'], tools=[])
         actor_msg_thread.add_user(sorted_correct_tool_calls[0]['collated_tool_response'])
         print_retrieval(sorted_correct_tool_calls[0]['actor_response'], f"round {round_no}", print_callback=print_callback)
         
-        # ZZ: save the rejection sampling actor results and critic feedbacks
-        combined_info_list = correct_tool_calls + incorrect_tool_calls + correct_buggy_locations + incorrect_buggy_locations
         actor_msg_thread.add_rejection_sampled_messages(combined_info_list)
-
-        # ZZ: TODO Do we need to print this ? Or delete this logic ...
         selected_apis_json = json.loads(sorted_correct_tool_calls[0]['parsed_apis'])
         json_api_calls, buggy_locations = print_selected_search_action_results(selected_apis_json, 
             sorted_correct_tool_calls[0]['collated_tool_response'], round_no, print_callback)
-        
-        # TODO FIXME update the logic that make sure the bug location and reasoning are correct
-        # Should we set a threshold ? Filtering logic say reward == 1 ? 
+        # TODO FIXME run parallel generation here and then sequentially apply the changes, then save the whole trajectory and finish the whole pipeline here .
         if sorted_correct_tool_calls[0]['action_type'] == "BUG_LOCATION":
             # If the selected action is bug locations, it should 
             print_banner("PATCH GENERATION")
@@ -494,15 +531,23 @@ def start_conversation_round_stratified(
                 "patch generation round 1",
                 print_callback=print_callback,
             )
-            break
-        
-        # ZZ: TODO specify the analysis directions and critic scoring fields 
+            # TODO: We need to differentiate situations where contexts collected are enough versus conv rounds limit reached
+            intent = FunctionCallIntent("write_patch", {}, None)
+            api_manager.start_new_tool_call_layer()
+            api_manager.dispatch_intent(intent, actor_msg_thread, print_callback=print_callback)
+            logger.info(f"Invoked {intent.func_name}.")
+
+            logger.info("Ending workflow.")
+            conversation_file = pjoin(output_dir, f"conversation_round_{round_no}.json")
+            actor_msg_thread.save_to_file(conversation_file)
+            break # TODO
+         
         msg = """Let's analyze collected context in the following desired format:
-Code Explanation 1: [For the first search result, briefly explain its functionalities.]
+Code Explanation 1: [For the first search result, briefly explain the functionalities/logic of the code snippet returned.]
 Code Relevance 1: [For the first search result, what role does it play in the execution chain of the issue described? Is the bug directly located within this search result rather than nested in one of its related function calls?]   
 Is Bug Location 1: [Insert `true` or `false` here ONLY] 
 
-Code Explanation 2: [For the second search result, briefly explain its functionalities.]
+Code Explanation 2: [For the second search result, briefly explain the functionalities/logic of the code snippet returned.]
 Code Relevance 2: [For the second search result, what role does it play in the execution chain of the issue described? Is the bug directly located within this search result rather than nested in one of its related function calls?]   
 Is Bug Location 2: [Insert `true` or `false` here ONLY] 
 
@@ -512,67 +557,34 @@ Is Bug Location 2: [Insert `true` or `false` here ONLY]
         print_acr(
             msg, f"context retrieval round {round_no}", print_callback=print_callback
         )
-        with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
-            futures = list(executor.map(lambda x: actor_model_helper(actor_msg_thread.to_msg()), range(globals.rejection_sampling_k)))
-        res_text_list = [f[0] for f in futures]
-        common.thread_cost.process_cost += sum([f[1] for f in futures])
-        common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
-        common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+        search_analysis_condition_met = False
+        search_analysis_info_list = []
+        while not search_analysis_condition_met:
+            with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
+                futures = list(executor.map(lambda x: actor_model_helper(actor_msg_thread.to_msg()), range(globals.rejection_sampling_k)))
+            res_text_list = [f[0] for f in futures]
+            common.thread_cost.process_cost += sum([f[1] for f in futures])
+            common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
+            common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
 
-        # TODO: Do we really need to analyse the bug locations ? Or do we need k analysis ? 
-        with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
-            futures = list(executor.map(lambda res_text: search_analysis_critic_helper(res_text, 
-                sorted_correct_tool_calls[0]["collated_tool_response"], critic_msg_thread.to_msg()), res_text_list))
-        common.thread_cost.process_cost += sum([f[1] for f in futures])
-        common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
-        common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
-        search_analysis_info_list = [f[0] for f in futures]
-        parse_search_analysis_critic_feedbacks(search_analysis_info_list)
-        
+            with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
+                futures = list(executor.map(lambda res_text: search_analysis_critic_helper(res_text, 
+                    sorted_correct_tool_calls[0]["collated_tool_response"], critic_msg_thread.to_msg()), res_text_list))
+            common.thread_cost.process_cost += sum([f[1] for f in futures])
+            common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
+            common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
+            search_analysis_list = [f[0] for f in futures]
+            parse_search_analysis_critic_feedbacks(search_analysis_list)
+            search_analysis_info_list.extend(search_analysis_list)
+            sorted_search_analysis_list = sorted(search_analysis_info_list, key=lambda x: x['reward'], reverse=True) 
+            search_analysis_condition_met = sorted_search_analysis_list[0]['condition_met']
+            
         # ZZ: select the best search analysis 
-        sorted_search_analysis_list = sorted(search_analysis_info_list, key=lambda x: x['reward'], reverse=True) 
         sorted_search_analysis_list[0]['selected'] = True
         actor_msg_thread.add_model(sorted_search_analysis_list[0]['actor_response'], tools=[])        
         print_retrieval(sorted_search_analysis_list[0]['actor_response'], f"round {round_no}", print_callback=print_callback)
-
         # ZZ: save the rejection sampling actor results and critic feedbacks
         actor_msg_thread.add_rejection_sampled_messages(search_analysis_info_list)
-
-        if round_no < globals.conv_round_limit:
-            # ZZ: TODO Do we want to make the LLM only output either the search actions or bug locations but not both ?  
-            msg = (
-                "Based on your analysis, please address the following:"
-                "\n1. Do we need more context? If yes, generate search API calls to gather additional project context. Leave this blank if no further context is needed."
-                "\n2. Where are the bug locations? Specify the file paths, class names, function names, or variable names if identified. Leave this blank if insufficient information is available."
-                "\n\nResponse Format:"
-                "\nIssue Analysis: [Briefly summarize the current progress, focusing on whether more context is needed or if the bug location can already be determined.]"
-                "\nSearch Action 1: [Include the first search call with specific arguments. Omit if sufficient context has been gathered for fault localization.]"
-                "\nSearch Action 2: [Include the second search call with specific arguments. Omit if sufficient context has been gathered for fault localization.]"
-                "\n..."
-                "\nBug Location 1 - Reasoning: [Identify the location and provide a brief explanation of why the bug likely occurs here, including any evidence or reasoning, and suggest potential modifications to address the issue.]"
-                "\nBug Location 1 - File Path: [Provide the file path of the first identified bug location. Leave blank if unknown.]"
-                "\nBug Location 1 - Class Name: [Provide the class name for the first bug location within the file path. Leave blank if unknown.]"
-                "\nBug Location 1 - Method Name: [Provide the method name for the first bug location within the file path. Leave blank if unknown.]"
-                "\nBug Location 1 - Variable Name: [Provide the variable name for the first bug location within the file path. Leave blank if unknown.]"
-                "\n..."
-            )
-            actor_msg_thread.add_user(msg)
-            print_acr(
-                msg,
-                f"context retrieval round {round_no}",
-                print_callback=print_callback,
-            )
-
-    round_no += 1
-    # TODO: We need to differentiate situations where contexts collected are enough versus conv rounds limit reached
-    intent = FunctionCallIntent("write_patch", {}, None)
-    api_manager.start_new_tool_call_layer()
-    api_manager.dispatch_intent(intent, actor_msg_thread, print_callback=print_callback)
-    logger.info(f"Invoked {intent.func_name}.")
-
-    logger.info("Ending workflow.")
-    conversation_file = pjoin(output_dir, f"conversation_round_{round_no}.json")
-    actor_msg_thread.save_to_file(conversation_file)
 
     return True
 
@@ -771,7 +783,7 @@ def run_one_task(
         api_manager (ProjectApiManager): The already-initialized API manager.
         problem_stmt (str): The original problem statement submitted to the task issue.
     """
-    # ZZ: Get explanation for critic model first. TODO print related info ... 
+    # ZZ: Get explanation for critic model first.
     print_banner("Collecting explanations for the issue")
     exp_prompt, explanation_result = get_patch_explanation(repo_name, problem_stmt, fix_patch, api_manager)
     critic_msg_thread = MessageThread()

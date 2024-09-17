@@ -92,6 +92,9 @@ def main(args, subparser_dest_attr_name: str = "command"):
     globals.disable_patch_generation = args.output_fix_locs
     globals.context_generation_limit = args.output_fix_limit
     globals.rejection_sampling_k = args.rejection_sampling_k
+    globals.rejection_sampling_rounds = args.rejection_sampling_rounds
+    globals.total_request_num = args.total_request_num
+    
 
     subcommand = getattr(args, subparser_dest_attr_name)
     if subcommand == "swe-bench":
@@ -251,6 +254,18 @@ def add_task_related_args(parser: ArgumentParser) -> None:
         type=int,
         default=5,
         help="The number of possible outcomes to sample at each step for rejection sampling.",
+    )
+    parser.add_argument(
+        "--total_request_num",
+        type=int,
+        default=100,
+        help="The budget number of API requests for actor/critic models.",
+    )
+    parser.add_argument(
+        "--rejection_sampling_rounds",
+        type=int,
+        default=5,
+        help="The number of rounds to repeat rejection sampling if progress is stuck.",
     )
     parser.add_argument(
         "--conv-round-limit",
