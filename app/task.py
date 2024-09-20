@@ -83,14 +83,15 @@ class SweTask(Task):
         with apputils.cd(task.project_path):
             apputils.repo_reset_and_clean_checkout(task.commit)
 
+        # ZZ: TODO FIXME for data collection, we do not run any testing, so neglect this install for now
         # Install task-specific dependencies
-        do_install = (
-            globals.enable_sbfl
-            or globals.enable_validation
-            or globals.only_save_sbfl_result
-        )
-        if do_install:
-            self._do_install()
+        # do_install = (
+        #     globals.enable_sbfl
+        #     or globals.enable_validation
+        #     or globals.only_save_sbfl_result
+        # )
+        # if do_install:
+        #     self._do_install()
 
         # apply the test modifications to this task
         self._apply_test_patch()
