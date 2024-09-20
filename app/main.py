@@ -79,8 +79,7 @@ def main(args, subparser_dest_attr_name: str = "command"):
     # model related
     common.set_model(args.actor_model, args.actor_model_api_key, args.actor_model_base_url, args.actor_model_temperature,
                      args.critic_model, args.critic_model_api_key, args.critic_model_base_url, args.critic_model_temperature)
-    # FIXME: make temperature part of the Model class
-    common.ACTOR_MODEL_TEMP, common.CRITIC_MODEL_TEMP  = args.actor_model_temperature, args.critic_model_temperature
+    
     # acr related
     globals.conv_round_limit = args.conv_round_limit
     globals.enable_layered = args.enable_layered

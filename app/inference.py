@@ -109,23 +109,32 @@ def add_step_trigger(orig_prompt: str, is_first: bool = False) -> str:
 
 def parse_search_actions_and_bug_locations(res_text_list):
     result_list = []
-    search_pattern = r'Search Action \d+:\s*(?:`|```(?:python)?)?\s*(search_\w+\((?:[^()]*|\([^()]*\)|".*?"|\'.*?\')*?\))\s*(?:`|```)?'
-    # TODO FIXME fix this format 
-    location_pattern = r"Bug Location (\d+) - (Reasoning|File Path|Class Name|Function Name|Variable Name):\s*(.*)"
+    search_pattern = r'Search Action \d+:\s*(?:`|```(?:python)?)?\s*(search_\w+\((?:[^()]*|\([^()]*\)|".*?"|\'.*?\')*?\))\s*(?:`|```)?' 
+    location_pattern = re.compile(
+        r"Bug Location \d+: \n"
+        r"    File Path: (?P<file_path>.*?)\n"
+        r"(?:    Class Name: (?P<class_name>.*?)\n)?"
+        r"(?:    Function Name: (?P<function_name>.*?)\n)?"
+        r"(?:    Variable Name: (?P<variable_name>.*?)\n)?"
+        r"    Reason: (?P<reason>.*?)(?:\n|$)",
+        re.DOTALL
+    )
     for res_text in res_text_list:
         api_json = {'API_calls':[], 'bug_locations': []}
         search_matches = re.findall(search_pattern, res_text)
         for m in search_matches:
             api_json['API_calls'].append(m)
-        bug_locations_with_indices = re.findall(location_pattern, res_text)
-        location_mapper = defaultdict(dict)
-        item_type_mapper = {"File Path": "file_name", "Class Name": "class_name", "Reasoning": 'reasoning',
-                            "Method Name": "method_name", "Variable Name": "variable_name"}
-        for index, item_type, value in bug_locations_with_indices:
-            if value:
-                location_mapper[index][item_type_mapper[item_type]] = value
-        for bug_loc_index, bug_loc_info in location_mapper.items():
-            api_json['bug_locations'].append(bug_loc_info)
+        matches_flexible = location_pattern.finditer(res_text)
+        bug_locations = [
+            {
+                "file_name": match.group("file_path"),
+                "class_name": match.group("class_name") if match.group("class_name") else None,
+                "method_name": match.group("function_name") if match.group("function_name") else None,
+                "variable_name": match.group("variable_name") if match.group("variable_name") else None,
+                "reasoning": match.group("reason")
+            } for match in matches_flexible
+        ]
+        api_json['bug_locations'].extend(bug_locations)
         is_valid, validness_summary = is_valid_response(api_json)
         if is_valid:
             result_list.append((json.dumps(api_json),res_text)) 
@@ -193,10 +202,12 @@ def parse_search_action_critic_feedbacks(correct_call_info_list):
     return 
         
 
-def search_analysis_critic_helper(actor_res, collated_tool_response, critic_msg_thread):
+def search_analysis_critic_helper(actor_res, collated_tool_response, critic_msg_thread, fix_patch):
+    # static checking of the requires modification field will lead to many corner cases, let LLM decide instead
+    # TODO add fix patch here again, let LLM decide if the search context requries modification or not . GT, Predicted, match or not  
     critic_prompt = f"""Given the information above, can you help me to determine if the following search analysis on the search results make sense or not?  
-Specifically, for each search result there will be a corresponding analysis on its functionality and if it is the bug location.
-Your job is to (1) decide if the analysis on the functionality within the code execution chain is reasonable or not and (2) decide if the determination of bug location is correct or not.
+Specifically, for each search result there will be a corresponding analysis on its functionality and if it requires modification to fix the issue.
+Your job is to (1) decide if the analysis on the functionality within the code execution chain is reasonable or not and (2) decide if the modification requiredness aligns with the ground truth patch or not.
 
 ### Search results
 {collated_tool_response}
@@ -205,14 +216,19 @@ Your job is to (1) decide if the analysis on the functionality within the code e
 ### Search Analysis 
 {actor_res}
 
-**Please answer in the following format**:
-Search Analysis Review 1: [Insert a brief reasoning on the correctness of the first analysis on the functionality and bug location here.]
-Functionality Correctness 1: [Insert only 'correct' or 'incorrect' here.]
-Bug Location Correctness 1: [Insert only 'correct' or 'incorrect' here.]
 
-Search Analysis Review 2: [Insert a brief reasoning on the correctness of the second analysis on the functionality and bug location here.]
+### Ground Truth Solution 
+{fix_patch}
+
+
+**Please answer in the following format**:
+Search Analysis Review 1: [Insert a brief reasoning on the correctness of the first analysis on the functionality. Then analyse if ground truth solution performed any modification directly within this search results or not. Finally determine if this aligns with the prediction `Modification Required` above]
+Functionality Correctness 1: [Insert only 'correct' or 'incorrect' here.]
+Modification Requiredness Correctness 1: [Insert only 'correct' or 'incorrect' here.]
+
+Search Analysis Review 2: [Insert a brief reasoning on the correctness of the second analysis on the functionality. Then analyse if ground truth solution performed any modification directly within this search results or not. Finally determine if this aligns with the prediction `Modification Required` above]
 Functionality Correctness 2: [Insert only 'correct' or 'incorrect' here.]
-Bug Location Correctness 2: [Insert only 'correct' or 'incorrect' here.]
+Modification Requiredness Correctness 2: [Insert only 'correct' or 'incorrect' here.]
 ...
 """
     relevant_thread = critic_msg_thread + [{"role": 'user', 'content':critic_prompt}]
@@ -227,11 +243,14 @@ Bug Location Correctness 2: [Insert only 'correct' or 'incorrect' here.]
 
 def parse_search_analysis_critic_feedbacks(analysis_info_list):
     for analysis_info in analysis_info_list:
-        pattern = r'Functionality Correctness \d+: (\w+)\nBug Location Correctness \d+: (\w+)'
-        matches = re.findall(pattern, analysis_info["critic_response"])
+        functionality_correctness_regex = re.compile(r'\*?\*?Functionality Correctness\s*\d:+\*?\*?\s*(correct|incorrect)\s*\*?\*?', re.IGNORECASE | re.DOTALL)
+        modification_requiredness_correctness_regex = re.compile(r'\*?\*?Modification Requiredness Correctness\s*\d:+\*?\*?\s*(correct|incorrect)\s*\*?\*?', re.IGNORECASE | re.DOTALL)
+        func_matches = functionality_correctness_regex.findall(analysis_info["critic_response"])
+        mod_matches = modification_requiredness_correctness_regex.findall(analysis_info["critic_response"])
+
         acc_score, action_count = 0, 0
         condition_met = True # all the analysis need to be correct  
-        for functionality, bug_location in matches:
+        for functionality, bug_location in zip(func_matches, mod_matches):
             # ZZ: TODO be careful about the rewards given to functionality analysis and bug location analysis
             action_count += 1
             if functionality.strip().lower() == 'correct': 
@@ -339,12 +358,12 @@ def get_search_or_bug_location_prompt(round_no, repo_name):
             "Based on the files, classes, methods, and code statements from the issue related to the bug, you can use the following search APIs to get more context of the project."
             "However, note that the search scope is limited to the issue codebase. Do not use the search tools for codebases imported or outside the issue codebase."
             f"Do not use local file_path the user described in the issue description for search, use the path that start from the issue codebase {repo_name} instead."
-            "\n- search_class(class_name: str): Search for a class in the codebase"
-            "\n- search_method_in_file(method_name: str, file_path: str): Search for a method in a given file"
-            "\n- search_method_in_class(method_name: str, class_name: str): Search for a method in a given class"
-            "\n- search_method(method_name: str): Search for a method in the entire codebase"
-            "\n- search_code(code_str: str): Search for a code snippet in the entire codebase"
-            "\n- search_code_in_file(code_str: str, file_path: str): Search for a code snippet in a given file file"
+            "\n- search_class(class_name): Search for a class in the codebase"
+            "\n- search_method_in_file(method_name, file_path): Search for a method in a given file"
+            "\n- search_method_in_class(method_name, class_name): Search for a method in a given class"
+            "\n- search_method(method_name): Search for a method in the entire codebase"
+            "\n- search_code(code_str): Search for a code snippet in the entire codebase"
+            "\n- search_code_in_file(code_str, file_path): Search for a code snippet in a given file file"
             "\n\nNote that you can use multiple search APIs in one round."
             "\nNow analyze the issue and select necessary APIs to get more context of the project. Each API call must have concrete arguments as inputs."
             "\n\nFollowing is the desired response format:"
@@ -360,7 +379,7 @@ def get_search_or_bug_location_prompt(round_no, repo_name):
             "\n1. Do we need more context? If yes, generate search API calls to gather additional project context. Leave this blank if no further context is needed."
             "\n2. Where are the bug locations? Provide the details in the specified format below. Leave this section blank if insufficient information is available."
             "\n\nResponse Format:"
-            "\nIssue Analysis: [Briefly summarize the current progress, focusing on whether more context is needed or if the bug location can already be determined.]"
+            "\nProgress Analysis: [Briefly summarize the current progress, focusing on whether more context is needed to understand the cause of the issue or if the bug location and corresponding fix can be determined already.]"
             "\nSearch Action 1: [Include the first search call with specific arguments. Omit if sufficient context has been gathered for fault localization.]"
             "\nSearch Action 2: [Include the second search call with specific arguments. Omit if sufficient context has been gathered for fault localization.]"
             "\n..."
@@ -370,13 +389,13 @@ def get_search_or_bug_location_prompt(round_no, repo_name):
             "\n    Class Name: [Name of the class where the bug is located. Omit if not applicable.]"
             "\n    Function Name: [Name of the function where the bug is located. Omit if not applicable.]"
             "\n    Variable Name: [Name of the variable involved in the bug. Omit if not applicable.]"
-            "\n    Reason: [Explain why the code causes the issue and what modifications are needed.]"
+            "\n    Reason: [Explain why the code causes the issue and what modifications are needed here.]"
             "\nBug Location 2: "
             "\n    File Path: [Full path to the file where the bug is located. Required.]"
             "\n    Class Name: [Name of the class where the bug is located. Omit if not applicable.]"
             "\n    Function Name: [Name of the function where the bug is located. Omit if not applicable.]"
             "\n    Variable Name: [Name of the variable involved in the bug. Omit if not applicable.]"
-            "\n    Reason: [Explain why the code causes the issue and what modifications are needed.]"
+            "\n    Reason: [Explain why the code causes the issue and what modifications are needed here.]"
             "\n..."
         )
     return prompt
@@ -481,7 +500,7 @@ def start_conversation_round_stratified(
     api_manager: ProjectApiManager,
     repo_name: str='',
     print_callback: Callable[[dict], None] | None = None,
-    fix_patch= str=''
+    fix_patch: str=''
 ) -> bool:
     """
     This version uses formatted response instead of using the OpenAI function calling.
@@ -644,15 +663,17 @@ def start_conversation_round_stratified(
             conversation_file = pjoin(output_dir, f"final_trajectory.json")
             actor_msg_thread.save_to_file(conversation_file)
             break 
-         
+        # summarize the contexts collected, update the understanding of the issues, then proceed to each context. Replace bug location with requires modification    
         msg = """Let's analyze collected context in the following desired format:
+Contexts Summary: [Summarize the contexts collected on what they do and how they contribute to the execution flow. Then reflect on how they update your knowledge on the root cause of the issue]
+
 Code Explanation 1: [For the first search result, briefly explain the functionalities/logic of the code snippet returned.]
-Code Relevance 1: [For the first search result, what role does it play in the execution chain of the issue described? Is the bug directly located within this search result rather than nested in one of its related function calls?]   
-Is Bug Location 1: [Insert `true` or `false` here ONLY] 
+Code Relevance 1: [For the first search result, analyze if we need any modification here to contribute to the fix solution to the issue. If so, what is it?]   
+Modification Required 1: [Insert `true` or `false` here ONLY] 
 
 Code Explanation 2: [For the second search result, briefly explain the functionalities/logic of the code snippet returned.]
-Code Relevance 2: [For the second search result, what role does it play in the execution chain of the issue described? Is the bug directly located within this search result rather than nested in one of its related function calls?]   
-Is Bug Location 2: [Insert `true` or `false` here ONLY] 
+Code Relevance 2: [For the second search result, analyze if we need any modification here to contribute to the fix solution to the issue. If so, what is it?]   
+Modification Required 2: [Insert `true` or `false` here ONLY] 
 
 ...
 """
@@ -674,7 +695,7 @@ Is Bug Location 2: [Insert `true` or `false` here ONLY]
 
             with ThreadPoolExecutor(max_workers=globals.rejection_sampling_k) as executor:
                 futures = list(executor.map(lambda res_text: search_analysis_critic_helper(res_text, 
-                    sorted_correct_tool_calls[0]["collated_tool_response"], critic_msg_thread.to_msg()), res_text_list))
+                    sorted_correct_tool_calls[0]["collated_tool_response"], critic_msg_thread.to_msg(), fix_patch), res_text_list))
             common.thread_cost.process_cost += sum([f[1] for f in futures])
             common.thread_cost.process_input_tokens += sum([f[2] for f in futures])
             common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
