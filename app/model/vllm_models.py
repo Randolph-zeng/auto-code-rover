@@ -20,7 +20,7 @@ from openai.types.chat.chat_completion_tool_choice_option_param import (
     ChatCompletionToolChoiceOptionParam,
 )
 from openai.types.chat.completion_create_params import ResponseFormat
-from tenacity import retry, stop_after_attempt, wait_random_exponential
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 from app.data_structures import FunctionCallIntent
 from app.log import log_and_print
@@ -104,7 +104,7 @@ class OpenaiModel(Model):
         return content
 
     # FIXME: the returned type contains OpenAI specific Types, which should be avoided
-    @retry(wait=wait_random_exponential(min=20, max=60), stop=stop_after_attempt(3))
+    @retry(wait=wait_fixed(60), stop=stop_after_attempt(3))
     def call(
         self,
         messages: list[dict],

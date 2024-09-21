@@ -379,11 +379,11 @@ def get_search_or_bug_location_prompt(round_no, repo_name):
             "\n1. Do we need more context? If yes, generate search API calls to gather additional project context. Leave this blank if no further context is needed."
             "\n2. Where are the bug locations? Provide the details in the specified format below. Leave this section blank if insufficient information is available."
             "\n\nResponse Format:"
-            "\nProgress Analysis: [Briefly summarize the current progress, focusing on whether more context is needed to understand the cause of the issue or if the bug location and corresponding fix can be determined already.]"
+            "\nProgress Analysis: [Briefly summarize the current progress, focusing on whether more context is needed to understand the cause of the issue or if ALL the code snippets that requires modification can be determined already.]"
             "\nSearch Action 1: [Include the first search call with specific arguments. Omit if sufficient context has been gathered for fault localization.]"
             "\nSearch Action 2: [Include the second search call with specific arguments. Omit if sufficient context has been gathered for fault localization.]"
             "\n..."
-            "\nBug Location Analysis: [If enough context is gathered, identify potential locations that require modifications. For each location, explain why the code causes the issue and what modifications are needed. Leave the analysis and following location blocks **BLANK** if unknown.]"
+            "\nBug Location Analysis: [For the search results that requires modification, explain why the code causes the issue and what modifications are needed. Leave the analysis and following location blocks **BLANK** if unknown.]"
             "\nBug Location 1: "
             "\n    File Path: [Full path to the file where the bug is located. Required.]"
             "\n    Class Name: [Name of the class where the bug is located. Omit if not applicable.]"
@@ -610,7 +610,7 @@ def start_conversation_round_stratified(
                             'selected': False,
                             'action_type': 'FAILED'
                         })
-            # ZZ: TODO FIXME The comparsion between rewards given in search and bug actions should be fair!
+            # ZZ: TODO FIXME What if some do search and some propose bug locations only ? or some search + correct bug locations, How to compare reward values ?
             if correct_tool_calls:
                 with ThreadPoolExecutor(max_workers=len(correct_tool_calls)) as executor:
                     futures = list(executor.map(lambda correct_call_info: search_action_critic_helper(correct_call_info, critic_msg_thread.to_msg()), correct_tool_calls))
@@ -628,6 +628,7 @@ def start_conversation_round_stratified(
                 common.thread_cost.process_output_tokens += sum([f[3] for f in futures])
                 parse_buggy_location_critic_feedbacks(correct_buggy_locations)
                 api_request_count += len(correct_buggy_locations)
+                # TODO FIXME Save the buggy locations and at some point judge if all the locations that requires modification are collected ! 
 
             sorted_correct_tool_calls = sorted(correct_tool_calls+correct_buggy_locations, key=lambda x: x['reward'], reverse=True) 
             # ZZ: save the rejection sampling actor results and critic feedbacks
@@ -649,7 +650,8 @@ def start_conversation_round_stratified(
         if api_request_count >= globals.total_request_num:
             print_acr(f"Finish the trajectory collection due to api request number exceeds the budget {globals.total_request_num} ...", "Trajectory Collection Finished", print_callback=print_callback) 
             break
-
+        
+        # TODO FIXME add the check that if all the contexts required are 
         # run parallel generation here and then sequentially apply the changes, then save the whole trajectory and finish the whole pipeline here .
         if sorted_correct_tool_calls[0]['action_type'] == "BUG_LOCATION":
             # If the selected action is bug locations, it should 
@@ -668,11 +670,11 @@ def start_conversation_round_stratified(
 Contexts Summary: [Summarize the contexts collected on what they do and how they contribute to the execution flow. Then reflect on how they update your knowledge on the root cause of the issue]
 
 Code Explanation 1: [For the first search result, briefly explain the functionalities/logic of the code snippet returned.]
-Code Relevance 1: [For the first search result, analyze if we need any modification here to contribute to the fix solution to the issue. If so, what is it?]   
+Code Relevance 1: [For the first search result, analyze if we need any modification here to fix the issue. If so, what is it?]   
 Modification Required 1: [Insert `true` or `false` here ONLY] 
 
 Code Explanation 2: [For the second search result, briefly explain the functionalities/logic of the code snippet returned.]
-Code Relevance 2: [For the second search result, analyze if we need any modification here to contribute to the fix solution to the issue. If so, what is it?]   
+Code Relevance 2: [For the second search result, analyze if we need any modification here to fix the issue. If so, what is it?]   
 Modification Required 2: [Insert `true` or `false` here ONLY] 
 
 ...
