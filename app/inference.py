@@ -182,9 +182,9 @@ Category: [Insert only 'Relevant', 'Neutral', 'Unrelated' or 'Imprecise' here.]
 
 def parse_search_action_critic_feedbacks(correct_call_info_list):
     for correct_call_info in correct_call_info_list:
-        categories = re.findall(r'Category: (\w+)', correct_call_info["critic_response"])
+        categories = re.findall(r'\*?\*?Category:\*?\*?\s(\w+)', correct_call_info["critic_response"])
         category_mapper = {
-            'relevant': 1, 'neutral': 0.5, 'unrelated': 0, 'imprecise': -0.2
+            'relevant': 1, 'neutral': 0.5, 'unrelated': 0, 'imprecise': -0.5
         }
         acc_score, success_cat_num = 0, 0 
         condition_met = False
@@ -300,10 +300,10 @@ Correctness of Modification Explanation 2: [Insert only 'correct' or 'incorrect'
 
 def parse_buggy_location_critic_feedbacks(buggy_loc_info_list):
     for buggy_loc_info in buggy_loc_info_list:
-        location_correctness_pattern = r"\**Correctness of Modification Location \d+\**:\s*\**(correct|incorrect)\**"
-        explanation_correctness_pattern = r"\**Correctness of Modification Explanation \d+\**:\s*\**(correct|incorrect)\**"
-        loc_matches = re.findall(location_correctness_pattern, buggy_loc_info["critic_response"])
-        exp_matches = re.findall(explanation_correctness_pattern, buggy_loc_info["critic_response"])
+        location_correctness_pattern = r"\*?\*?Correctness of Modification Location \d:+\*?\*?\s*[-\s]*(correct|incorrect)"
+        explanation_correctness_pattern = r"\*?\*?Correctness of Modification Explanation \d:+\*?\*?\s*[-\s]*(correct|incorrect)"
+        loc_matches = re.findall(location_correctness_pattern, buggy_loc_info["critic_response"], re.IGNORECASE)
+        exp_matches = re.findall(explanation_correctness_pattern, buggy_loc_info["critic_response"], re.IGNORECASE)
         acc_score, loc_num = 0, 0 
         condition_met = True # for every location proposed, both the location and explanation need to be correct 
         for loc_mat, exp_mat in zip(loc_matches, exp_matches):
