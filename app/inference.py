@@ -111,7 +111,7 @@ def parse_search_actions_and_bug_locations(res_text_list):
     result_list = []
     search_pattern = r'Search Action \d+:\s*(?:`|```(?:python)?)?\s*(search_\w+\((?:[^()]*|\([^()]*\)|".*?"|\'.*?\')*?\))\s*(?:`|```)?' 
     location_pattern = re.compile(
-        r"Bug Location \d+: \n"
+        r"Modification Location \d+: \n"
         r"    File Path: (?P<file_path>.*?)\n"
         r"(?:    Class Name: (?P<class_name>.*?)\n)?"
         r"(?:    Function Name: (?P<function_name>.*?)\n)?"
@@ -274,20 +274,20 @@ def buggy_loc_critic_helper(buggy_loc_info, critic_msg_thread):
     # ZZ: the actor response contains location and location related reasoning, we should not need any collated search results 
     # TODO FIXME Add a logic that extracts all the modified locations and ask the critic model to check if all are found. 
     critic_prompt= f"""
-Given the information above, please evaluate the following bug locations and their analyses to determine if they are correct and reasonable for generating a final patch to fix the issue.
+Given the information above, please evaluate the following modification locations and their analyses to determine if they are correct and reasonable for generating a final patch to fix the issue.
 
-# Bug Locations and Analyses
+# Modification Locations and Analyses
 {buggy_loc_info['actor_response']}
 
 Please provide your assessment in the format below:
 
-Bug Location 1 - Analysis: [Evaluate whether the first bug location identified and its associated analysis are correct. Provide a brief reasoning.]
-Bug Location 1 - Correctness: [Insert only 'correct' or 'incorrect' here]
-Bug Explanation 1 - Correctness: [Insert only 'correct' or 'incorrect' here]
+Analysis of Modification Location 1: [Evaluate whether the first modification location identified and its associated analysis are correct. Provide a brief reasoning.]
+Correctness of Modification Location 1: [Insert only 'correct' or 'incorrect' here]
+Correctness of Modification Explanation 1: [Insert only 'correct' or 'incorrect' here]
 
-Bug Location 2 - Analysis: [Evaluate whether the second bug location identified and its associated analysis are correct. Provide a brief reasoning.]
-Bug Location 2 - Correctness: [Insert only 'correct' or 'incorrect' here]
-Bug Explanation 2 - Correctness: [Insert only 'correct' or 'incorrect' here]
+Analysis of Modification Location 2: [Evaluate whether the second modification location identified and its associated analysis are correct. Provide a brief reasoning.]
+Correctness of Modification Location 2: [Insert only 'correct' or 'incorrect' here]
+Correctness of Modification Explanation 2: [Insert only 'correct' or 'incorrect' here]
 
 ...
 """
@@ -300,8 +300,8 @@ Bug Explanation 2 - Correctness: [Insert only 'correct' or 'incorrect' here]
 
 def parse_buggy_location_critic_feedbacks(buggy_loc_info_list):
     for buggy_loc_info in buggy_loc_info_list:
-        location_correctness_pattern = r"\**Correctness of Bug Location \d+\**:\s*\**(correct|incorrect)\**"
-        explanation_correctness_pattern = r"\**Correctness of Bug Explanation \d+\**:\s*\**(correct|incorrect)\**"
+        location_correctness_pattern = r"\**Correctness of Modification Location \d+\**:\s*\**(correct|incorrect)\**"
+        explanation_correctness_pattern = r"\**Correctness of Modification Explanation \d+\**:\s*\**(correct|incorrect)\**"
         loc_matches = re.findall(location_correctness_pattern, buggy_loc_info["critic_response"])
         exp_matches = re.findall(explanation_correctness_pattern, buggy_loc_info["critic_response"])
         acc_score, loc_num = 0, 0 
@@ -355,7 +355,7 @@ def get_search_or_bug_location_prompt(round_no, repo_name):
     if round_no == 0:
         # ZZ: specify the return format in here so that we can avoid the unnecessary api calls 
         prompt = (
-            "Based on the files, classes, methods, and code statements from the issue related to the bug, you can use the following search APIs to get more context of the project."
+            "Based on the files, classes, methods, and code statements from the issue related to the bug/feature request, you can use the following search APIs to get more context of the project."
             "However, note that the search scope is limited to the issue codebase. Do not use the search tools for codebases imported or outside the issue codebase."
             f"Do not use local file_path the user described in the issue description for search, use the path that start from the issue codebase {repo_name} instead."
             "\n- search_class(class_name): Search for a class in the codebase"
@@ -367,7 +367,7 @@ def get_search_or_bug_location_prompt(round_no, repo_name):
             "\n\nNote that you can use multiple search APIs in one round."
             "\nNow analyze the issue and select necessary APIs to get more context of the project. Each API call must have concrete arguments as inputs."
             "\n\nFollowing is the desired response format:"
-            "\nIssue Analysis: [Provide a brief analysis on the issue, with a focus on what further contexts would we need to collect to locate the bug location and explain the underlying problem.]"
+            "\nIssue Analysis: [Provide a brief analysis on the issue, with a focus on what further contexts would we need to collect to fully understand the issue and locate the bug locations or modification locations for feature request.]"
             "\nSearch Action 1: [Insert the first search call here with concrete arguments. Do not use any path from user directory, use path starts from the issue codebase instead]"
             "\nSearch Action 2: [Insert the second search call here with concrete arguments. ]"
             "\n..."
@@ -377,25 +377,23 @@ def get_search_or_bug_location_prompt(round_no, repo_name):
         prompt = (
             "Based on your analysis, please address the following:"
             "\n1. Do we need more context? If yes, generate search API calls to gather additional project context. Leave this blank if no further context is needed."
-            "\n2. Where are the bug locations? Provide the details in the specified format below. Leave this section blank if insufficient information is available."
+            "\n2. Where are the locations to modify? Provide the details in the specified format below. Leave this section blank if insufficient information is available."
             "\n\nResponse Format:"
-            "\nProgress Analysis: [Briefly summarize the current progress, focusing on whether more context is needed to understand the cause of the issue or if ALL the code snippets that requires modification can be determined already.]"
-            "\nSearch Action 1: [Include the first search call with specific arguments. Omit if sufficient context has been gathered for fault localization.]"
-            "\nSearch Action 2: [Include the second search call with specific arguments. Omit if sufficient context has been gathered for fault localization.]"
+            "\nProgress Analysis: [Briefly summarize the current progress, focusing on if more context is needed to understand the cause of the issue or designs to implement the feature request. If ALL the code snippets that requires modification can be determined already, skip the search actions and proceed to the Modification Location Analysis.]"
+            "\nSearch Action 1: [Include the first search call with specific arguments. Omit if sufficient context has been gathered for modifications.]"
+            "\nSearch Action 2: [Include the second search call with specific arguments. Omit if sufficient context has been gathered for modifications.]"
             "\n..."
-            "\nBug Location Analysis: [For the search results that requires modification, explain why the code causes the issue and what modifications are needed. Leave the analysis and following location blocks **BLANK** if unknown.]"
-            "\nBug Location 1: "
-            "\n    File Path: [Full path to the file where the bug is located. Required.]"
-            "\n    Class Name: [Name of the class where the bug is located. Omit if not applicable.]"
-            "\n    Function Name: [Name of the function where the bug is located. Omit if not applicable.]"
-            "\n    Variable Name: [Name of the variable involved in the bug. Omit if not applicable.]"
-            "\n    Reason: [Explain why the code causes the issue and what modifications are needed here.]"
-            "\nBug Location 2: "
-            "\n    File Path: [Full path to the file where the bug is located. Required.]"
-            "\n    Class Name: [Name of the class where the bug is located. Omit if not applicable.]"
-            "\n    Function Name: [Name of the function where the bug is located. Omit if not applicable.]"
-            "\n    Variable Name: [Name of the variable involved in the bug. Omit if not applicable.]"
-            "\n    Reason: [Explain why the code causes the issue and what modifications are needed here.]"
+            "\nModification Location Analysis: [For the search results that requires modification, explain why they are related to the bug/feature request/issue and what modifications are needed. Leave the analysis and following location blocks **BLANK** if unknown.]"
+            "\nModification Location 1: "
+            "\n    File Path: [Full path to the file where the modification should take place. Required.]"
+            "\n    Class Name: [Name of the class for modification. Omit if not applicable.]"
+            "\n    Function Name: [Name of the function for modification. Omit if not applicable.]"
+            "\n    Reason: [Explain why the code is related to the issue and what modifications are needed here.]"
+            "\nModification Location 2: "
+            "\n    File Path: [Full path to the file where the modification should take place. Required.]"
+            "\n    Class Name: [Name of the class for modification. Omit if not applicable.]"
+            "\n    Function Name: [Name of the function for modification. Omit if not applicable.]"
+            "\n    Reason: [Explain why the code is related to the issue and what modifications are needed here.]"
             "\n..."
         )
     return prompt
@@ -491,7 +489,52 @@ def add_patch_info(actor_msg_thread, fix_patch, applicable_patch_list, inapplica
             'action_type': 'PATCH_GENERATION'
         })
     actor_msg_thread.add_rejection_sampled_messages(patch_info_list)
-    
+
+
+def is_bug_localization_finished(fix_patch, buggy_locations, critic_messages):
+    formatted_bug_locations = ""
+    for idx, bug_info in buggy_locations:
+        formatted_bug_locations += (
+            f'Nominated Modification Location {idx+1}: \n'
+            f"file_name: {bug_info['file_name']}\n"
+            f"class_name: {bug_info['class_name']}\n" if 'class_name' in bug_info else ''
+            f"method_name: {bug_info['method_name']}\n" if 'method_name' in bug_info else ''
+            f"variable_name: {bug_info['variable_name']}\n" if 'variable_name' in bug_info else ''
+            f"analysis: {bug_info['reasoning']}\n"
+        )
+    # TODO Patch includes modification on existing code and addition of non-existing code
+    # existing code modification can be nominated, but helper functions/new vars/new classes are hard to nominate exact locations
+    # Design the prompt such that it can handle cases mentioned above  
+    critic_prompt = f"""Given the analysis above, please compare the nominated modification locations and the actual modifications in the ground truth fix patch.
+Your job is to check if for every modification locations from the ground truth, there exists a corresponding location in the nominated list or not. 
+Note for the ground truth fix patch, it might contain some addition of helper functions, new classes or new variables that can be added in a number of different candidate places.
+For these additions, check if these changes are subsidiary changes of some nominated modification locations.   
+
+### Ground Truth Fix Patch
+{fix_patch}
+
+
+### Nominated Modification Locations   
+{formatted_bug_locations}
+
+
+Below is the desired format for response:
+Modification Location 1: [Insert the first ground truth modification locations here]
+Modification Location 1 Analysis: [Analyse if the first ground truth modification is nominated directly in the locations above or can be contained within a proposed modification.]
+Matched Nominated Location 1 : [Insert the matched nominated location or N/A here if no matched location found]
+
+Modification Location 2: [Insert the second ground truth modification locations here]
+Modification Location 2 Analysis: [Analyse if the second ground truth modification is nominated directly in the locations above or can be contained within a proposed modification.]
+Matched Nominated Location 2 : [Insert the matched nominated location or N/A here if no matched location found] 
+
+...
+"""
+    relevant_thread = critic_messages + [{"role": 'user', 'content':critic_prompt}]
+    res_text, cost, input_tokens, output_tokens = common.CRITIC_MODEL.call(relevant_thread)
+    # parse the critic results and check if any N/A exists 
+    # TODO FIXME check if the prompts needs improvement
+    all_bug_found = not ('N/A' in res_text or 'n/a' in res_text)
+    return all_bug_found
 
 def start_conversation_round_stratified(
     output_dir: str,
@@ -634,7 +677,13 @@ def start_conversation_round_stratified(
             # ZZ: save the rejection sampling actor results and critic feedbacks
             combined_info_list.extend(correct_tool_calls + incorrect_tool_calls + correct_buggy_locations + incorrect_buggy_locations)
             # make sure 1. the search actions have at least one relevant 2. the bug location and reasoning are correct
-            search_action_condition_met = sorted_correct_tool_calls[0]['condition_met']
+            if sorted_correct_tool_calls[0]['condition_met']:
+                if sorted_correct_tool_calls[0]['action_type'] == "BUG_LOCATION":
+                    # For responses that only nominates bug locations, we require it to nominate every bug locations. Otherwise keeps sampling until the model wants to explore some other RELEVANT contexts with search actions
+                    search_action_condition_met = is_bug_localization_finished(fix_patch, sorted_correct_tool_calls[0]['critic_response'])
+                else:
+                    # For search actions, as long as the search contexts are relevant, we can proceed to search results analysis
+                    search_action_condition_met = True
             if api_request_count >= globals.total_request_num: break
             
         sorted_correct_tool_calls[0]['selected'] = True
@@ -667,14 +716,14 @@ def start_conversation_round_stratified(
             break 
         # summarize the contexts collected, update the understanding of the issues, then proceed to each context. Replace bug location with requires modification    
         msg = """Let's analyze collected context in the following desired format:
-Contexts Summary: [Summarize the contexts collected on what they do and how they contribute to the execution flow. Then reflect on how they update your knowledge on the root cause of the issue]
+Contexts Summary: [Summarize the contexts collected on what they do and how they contribute to the execution flow. Then reflect on how they update your knowledge on the root cause of the issue or design for feature request.]
 
 Code Explanation 1: [For the first search result, briefly explain the functionalities/logic of the code snippet returned.]
-Code Relevance 1: [For the first search result, analyze if we need any modification here to fix the issue. If so, what is it?]   
+Code Relevance 1: [For the first search result, analyze if we need any modification here to fix the issue or implement the feature request. If so, what is it?]   
 Modification Required 1: [Insert `true` or `false` here ONLY] 
 
 Code Explanation 2: [For the second search result, briefly explain the functionalities/logic of the code snippet returned.]
-Code Relevance 2: [For the second search result, analyze if we need any modification here to fix the issue. If so, what is it?]   
+Code Relevance 2: [For the second search result, analyze if we need any modification here to fix the issue or implement the feature request. If so, what is it?]   
 Modification Required 2: [Insert `true` or `false` here ONLY] 
 
 ...
