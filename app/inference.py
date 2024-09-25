@@ -134,6 +134,10 @@ def parse_search_actions_and_bug_locations(res_text_list):
                 "reasoning": match.group("reason")
             } for match in matches_flexible
         ]
+        # ZZ: adhoc post process on the values, might need adjustment when new cases comes up ...
+        for bug_info in bug_locations:
+            for k, v in bug_info.items():
+                if v: bug_info[k] = v.replace('`','')
         api_json['bug_locations'].extend(bug_locations)
         is_valid, validness_summary = is_valid_response(api_json)
         if is_valid:
@@ -629,7 +633,7 @@ def start_conversation_round_stratified(
                     # if no search action needed, we should examine the buggy locations and provide the buggy locations to the model
                     for bug_location in curr_buggy_locations:
                         tool_output, *_ = search_for_bug_location(
-                            api_manager, actor_msg_thread, bug_location
+                            api_manager, None, bug_location
                         )
                         collated_tool_response += f"\n\n{tool_output}\n"
                     if (
