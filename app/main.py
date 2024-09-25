@@ -349,20 +349,6 @@ def make_swe_tasks(
     with open(tasks_map_file) as f:
         tasks_map = json.load(f)
 
-    # Check if all task ids are in the setup and tasks map
-    # This allows failing safely if some tasks are not set up properly
-    missing_task_ids = [
-        x for x in all_task_ids if not (x in setup_map and x in tasks_map)
-    ]
-    if missing_task_ids:
-        # Log the tasks that are not in the setup or tasks map
-        for task_id in sorted(missing_task_ids):
-            log.print_with_time(
-                f"Skipping task {task_id} which was not found in setup or tasks map."
-            )
-        # And drop them from the list of all task ids
-        all_task_ids = filter(lambda x: x not in missing_task_ids, all_task_ids)
-
     all_task_ids = sorted(all_task_ids)
 
     # for each task in the list to run, create a Task instance

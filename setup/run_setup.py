@@ -157,6 +157,7 @@ def main(
         create_fresh_dir(testbed)
     create_fresh_dir(result_dir)
     tasks = load_task_instances(swe_bench_tasks)
+    # ZZ: Note we only save info about tasks we really setup to save time and space
     # map instance_id to the actual task instance Dict
     tasks_map = {t['instance_id']: t for t in tasks}
     # map instance_id to setup information
@@ -174,6 +175,8 @@ def main(
     # decide the path for their testbed folder, and save this path to task_map
     for instance_id, task in tasks_map.items():
         if subset_file is not None and instance_id not in selected_instances:
+            tasks_map.pop(instance_id)
+            setup_map.pop(instance_id)
             continue
         repo_full = task["repo"]  # "astropy/astropy"
         repo_short = instance_id.rsplit("-", 1)[0]  # "astropy"
