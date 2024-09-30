@@ -111,7 +111,7 @@ def parse_search_actions_and_bug_locations(res_text_list):
     result_list = []
     search_pattern = r'Search Action \d+:\s*(?:`|```(?:python)?)?\s*(search_\w+\((?:[^()]*|\([^()]*\)|".*?"|\'.*?\')*?\))\s*(?:`|```)?' 
     location_pattern = re.compile(
-        r"Modification Location \d+: \n"
+        r"Modification Location \d+: *\n"
         r"    File Path: (?P<file_path>.*?)\n"
         r"(?:    Class Name: (?P<class_name>.*?)\n)?"
         r"(?:    Function Name: (?P<function_name>.*?)\n)?"
@@ -312,8 +312,8 @@ def parse_buggy_location_critic_feedbacks(buggy_loc_info_list):
         condition_met = True # for every location proposed, both the location and explanation need to be correct 
         for loc_mat, exp_mat in zip(loc_matches, exp_matches):
             loc_num += 1
-            if loc_mat[1].lower() == 'correct':
-                if exp_mat[1].lower() == 'correct':
+            if loc_mat.strip().lower() == 'correct':
+                if exp_mat.strip().lower() == 'correct':
                     acc_score += 1
                 else:
                     acc_score += 0.5
@@ -497,7 +497,7 @@ def add_patch_info(actor_msg_thread, fix_patch, applicable_patch_list, inapplica
 
 def is_bug_localization_finished(fix_patch, buggy_locations, critic_messages):
     formatted_bug_locations = ""
-    for idx, bug_info in buggy_locations:
+    for idx, bug_info in enumerate(buggy_locations):
         formatted_bug_locations += (
             f'Nominated Modification Location {idx+1}: \n'
             f"file_name: {bug_info['file_name']}\n"
@@ -684,7 +684,10 @@ def start_conversation_round_stratified(
             if sorted_correct_tool_calls[0]['condition_met']:
                 if sorted_correct_tool_calls[0]['action_type'] == "BUG_LOCATION":
                     # For responses that only nominates bug locations, we require it to nominate every bug locations. Otherwise keeps sampling until the model wants to explore some other RELEVANT contexts with search actions
-                    search_action_condition_met = is_bug_localization_finished(fix_patch, sorted_correct_tool_calls[0]['critic_response'])
+                    # TODO: This might be a very strict condition, be very careful on the prompts and reasoning behind
+                    json.loads(sorted_correct_tool_calls[0]['parsed_apis'])
+                    buggy_locations = selected_apis_json.get("bug_locations", [])
+                    search_action_condition_met = is_bug_localization_finished(fix_patch, buggy_locations, critic_msg_thread.to_msg())
                 else:
                     # For search actions, as long as the search contexts are relevant, we can proceed to search results analysis
                     search_action_condition_met = True

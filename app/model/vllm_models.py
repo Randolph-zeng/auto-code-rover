@@ -194,9 +194,9 @@ class DeepseekCoderV2_16B_vllm(OpenaiModel):
         self.note = "DeepSeek-Coder-V2-Lite-Instruct served by local vllm server. Cost per input/output assumed to be zero."
 
 
-class DeepseekCoderV2_API(OpenaiModel):
+class DeepseekChatV2_5_API(OpenaiModel):
     def __init__(self):
         super().__init__(
-            "deepseek-coder", 0.000001, 0.000002, parallel_tool_call=True
+            "deepseek-chat", 0.000001, 0.000002, parallel_tool_call=True
         )
-        self.note = "DeepSeek-Coder-API served in openai style."
+        self.note = "DeepSeek-Chat-API served in openai style."
