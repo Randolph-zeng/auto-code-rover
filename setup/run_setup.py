@@ -159,9 +159,9 @@ def main(
     tasks = load_task_instances(swe_bench_tasks)
     # ZZ: Note we only save info about tasks we really setup to save time and space
     # map instance_id to the actual task instance Dict
-    tasks_map = {t['instance_id']: t for t in tasks}
+    full_tasks_map, filtered_tasks_map = {t['instance_id']: t for t in tasks}, {}
     # map instance_id to setup information
-    setup_map = {i: {} for i in tasks_map}
+    setup_map = {}
 
     # sometimes we just want to setup a subset of instances for quick experiments
     selected_instances = []  # only used if there is a subset_file
@@ -173,11 +173,11 @@ def main(
     setup_entries = []
     # iterates all tasks, decide which ones need setup,
     # decide the path for their testbed folder, and save this path to task_map
-    for instance_id, task in tasks_map.items():
+    for instance_id, task in full_tasks_map.items():
         if subset_file is not None and instance_id not in selected_instances:
-            tasks_map.pop(instance_id)
-            setup_map.pop(instance_id)
             continue
+        setup_map[instance_id] = {}
+        filtered_tasks_map[instance_id] = full_tasks_map[instance_id]
         repo_full = task["repo"]  # "astropy/astropy"
         repo_short = instance_id.rsplit("-", 1)[0]  # "astropy"
         version = task["version"]  # "4.2"
@@ -223,7 +223,7 @@ def main(
             pool.join()
     finally:
         # Done with the actual work.
-        save_setup_json_files(result_dir, setup_map, tasks_map)
+        save_setup_json_files(result_dir, setup_map, filtered_tasks_map)
 
 
 if __name__ == "__main__":
